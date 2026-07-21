@@ -1,3 +1,32 @@
+"""
+Renumber Markdown footnote references sequentially.
+
+This script fixes the numbering of footnote references in a Markdown file so
+they run consecutively starting from 1, in the order the numbers first appear.
+This is useful after editing or converting a document (e.g. from PDF), where
+footnotes may end up out of order or with gaps in their numbering.
+
+How it works:
+    - It scans the file for footnote references of the form ``[^N]`` (where N is
+      a number), while ignoring footnote definitions of the form ``[^N]:``.
+    - It collects the unique reference numbers, sorts them, and builds a mapping
+      that reassigns them to consecutive values (1, 2, 3, ...).
+    - It rewrites every reference using the new numbers, leaving footnote
+      definitions untouched.
+
+Usage:
+    Run the script directly::
+
+        python renumber_references.py
+
+    A native Linux file picker (Zenity) opens so you can choose a Markdown
+    file. The selected file is updated in place with the renumbered footnotes.
+
+Requirements:
+    - Zenity must be installed for the file picker
+      (e.g. ``sudo apt install zenity``).
+"""
+
 import re
 import sys
 import subprocess
