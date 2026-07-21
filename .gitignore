@@ -2,4 +2,3 @@ datalab_api_key.txt
 __pycache__/
 *.pyc
 .venv/
-fix_markdown.py
