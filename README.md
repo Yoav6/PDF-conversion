@@ -1,6 +1,6 @@
 # pdf_to_markdown
 
-GUI app to convert a PDF to clean Markdown (plus extracted images and a cover image) using the [Datalab](https://www.datalab.to) API, or to convert an existing Datalab JSON export to Markdown locally.
+GUI app to convert a PDF to Markdown (including images) using the [Datalab](https://www.datalab.to) API, or to convert an existing Datalab JSON export to Markdown locally.
 
 Datalab handles the layout analysis and OCR; the script then does a lot of extra work on the returned document to produce Markdown that reads like a real book rather than a raw dump of detected blocks.
 
