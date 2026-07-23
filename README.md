@@ -37,7 +37,7 @@ One PDF page (the first by default) is rendered to an image via poppler and save
 
 ### List and heading cleanup
 
-Nested lists are normalized from Datalab's indent classes into proper nested Markdown lists, and heading/emphasis HTML is converted to clean Markdown.
+Nested lists are normalized from Datalab's indent classes into proper nested Markdown lists, and heading/emphasis HTML is converted to clean Markdown. List markers are normalized too: source bullets become `*`, decimal numbers become `1. 2. 3.`, and alphabetic / roman lists keep their labels combined with markdown bullets (`* a. …`, `* i. …`). Consecutive same-level headings with only blank lines between them (a common split of a multi-line title) are combined into one heading.
 
 ### Two input modes
 

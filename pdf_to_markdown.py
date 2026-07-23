@@ -1347,13 +1347,363 @@ def _clear_list_indent_classes(li_tag) -> None:
         del li_tag.attrs["class"]
 
 
+# Source list-marker cleanup (glyphs / a,b,c / i,ii / 1,2,3 inside <li> text).
+_LIST_BULLET_GLYPH_RE = re.compile(
+    r"^[\s\u00a0]*[•●○◦▪▫■□‣∙\*∗·･・➢➤►▶▸‣]+[\s\u00a0]*"
+)
+_LIST_DASH_BULLET_RE = re.compile(r"^[\s\u00a0]*[-–—][\s\u00a0]+")
+_LIST_NUMBER_MARKER_RE = re.compile(
+    r"^[\s\u00a0]*(?:\(?\d+\)|\d{1,3}[.)])[\s\u00a0]*"
+)
+_LIST_ALPHA_LOWER_MARKER_RE = re.compile(
+    r"^[\s\u00a0]*(?:\(([a-z])\)|([a-z])[.)])[\s\u00a0]*"
+)
+_LIST_ALPHA_UPPER_MARKER_RE = re.compile(
+    r"^[\s\u00a0]*(?:\(([A-Z])\)|([A-Z])[.)])[\s\u00a0]*"
+)
+_LIST_ROMAN_LOWER_MARKER_RE = re.compile(
+    r"^[\s\u00a0]*(?:\(([ivxlcdm]+)\)|([ivxlcdm]+)[.)])[\s\u00a0]*"
+)
+_LIST_ROMAN_UPPER_MARKER_RE = re.compile(
+    r"^[\s\u00a0]*(?:\(([IVXLCDM]+)\)|([IVXLCDM]+)[.)])[\s\u00a0]*"
+)
+
+_OL_TYPE_TO_KIND = {
+    "1": "number",
+    "a": "alpha_lower",
+    "A": "alpha_upper",
+    "i": "roman_lower",
+    "I": "roman_upper",
+}
+
+
+def _int_to_roman(n: int) -> str:
+    if n <= 0:
+        return ""
+    parts = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ]
+    out = []
+    for value, glyph in parts:
+        while n >= value:
+            out.append(glyph)
+            n -= value
+    return "".join(out)
+
+
+def _roman_to_int(text: str) -> int | None:
+    raw = (text or "").strip().lower()
+    if not raw or any(ch not in "ivxlcdm" for ch in raw):
+        return None
+    values = {"m": 1000, "d": 500, "c": 100, "l": 50, "x": 10, "v": 5, "i": 1}
+    total = 0
+    prev = 0
+    for ch in reversed(raw):
+        value = values[ch]
+        if value < prev:
+            total -= value
+        else:
+            total += value
+            prev = value
+    if total <= 0 or _int_to_roman(total) != raw:
+        return None
+    return total
+
+
+def _int_to_alpha(n: int) -> str:
+    """1-based index → a, b, … z, aa, ab, …"""
+    if n <= 0:
+        return ""
+    chars: list[str] = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        chars.append(chr(ord("a") + rem))
+    return "".join(reversed(chars))
+
+
+def _direct_list_items(list_tag) -> list:
+    return [
+        child
+        for child in list_tag.children
+        if getattr(child, "name", None) == "li"
+    ]
+
+
+def _li_first_text_node(li_tag):
+    """Return the first non-empty NavigableString inside an <li>, if any."""
+    for descendant in li_tag.descendants:
+        if isinstance(descendant, str) and descendant.strip():
+            return descendant
+    return None
+
+
+def _li_leading_text(li_tag) -> str:
+    node = _li_first_text_node(li_tag)
+    return node if isinstance(node, str) else ""
+
+
+def _strip_li_leading(li_tag, pattern: re.Pattern) -> re.Match | None:
+    node = _li_first_text_node(li_tag)
+    if node is None:
+        return None
+    match = pattern.match(node)
+    if not match:
+        return None
+    node.replace_with(node[match.end() :])
+    return match
+
+
+def _prepend_li_text(li_tag, prefix: str) -> None:
+    for child in li_tag.children:
+        if getattr(child, "name", None) == "p":
+            for descendant in child.descendants:
+                if isinstance(descendant, str):
+                    descendant.replace_with(prefix + descendant)
+                    return
+            child.insert(0, prefix)
+            return
+    node = _li_first_text_node(li_tag)
+    if node is not None:
+        node.replace_with(prefix + node)
+        return
+    li_tag.insert(0, prefix)
+
+
+def _marker_label(match: re.Match | None) -> str | None:
+    if match is None:
+        return None
+    for group in match.groups():
+        if group:
+            return group
+    return None
+
+
+def _classify_li_marker(text: str) -> tuple[str, str | None]:
+    """
+    Classify a leading source marker in list-item text.
+
+    Returns (kind, label) where kind is one of:
+    bullet, number, alpha_lower, alpha_upper, roman_lower, roman_upper, none.
+    """
+    if not text or not text.strip():
+        return "none", None
+
+    if _LIST_BULLET_GLYPH_RE.match(text) or _LIST_DASH_BULLET_RE.match(text):
+        return "bullet", None
+
+    m = _LIST_NUMBER_MARKER_RE.match(text)
+    if m:
+        digits = re.search(r"\d+", m.group(0))
+        return "number", digits.group(0) if digits else None
+
+    # Prefer multi-character roman before single-letter alpha (ii. vs i.).
+    m = _LIST_ROMAN_LOWER_MARKER_RE.match(text)
+    if m:
+        label = _marker_label(m)
+        if label and _roman_to_int(label) is not None and len(label) > 1:
+            return "roman_lower", label.lower()
+
+    m = _LIST_ROMAN_UPPER_MARKER_RE.match(text)
+    if m:
+        label = _marker_label(m)
+        if label and _roman_to_int(label) is not None and len(label) > 1:
+            return "roman_upper", label.upper()
+
+    m = _LIST_ALPHA_LOWER_MARKER_RE.match(text)
+    if m:
+        return "alpha_lower", _marker_label(m)
+
+    m = _LIST_ALPHA_UPPER_MARKER_RE.match(text)
+    if m:
+        return "alpha_upper", _marker_label(m)
+
+    m = _LIST_ROMAN_LOWER_MARKER_RE.match(text)
+    if m:
+        label = _marker_label(m)
+        if label and _roman_to_int(label) is not None:
+            return "roman_lower", label.lower()
+
+    m = _LIST_ROMAN_UPPER_MARKER_RE.match(text)
+    if m:
+        label = _marker_label(m)
+        if label and _roman_to_int(label) is not None:
+            return "roman_upper", label.upper()
+
+    return "none", None
+
+
+def _looks_like_roman_sequence(labels: list[str]) -> bool:
+    if not labels:
+        return False
+    values: list[int] = []
+    for label in labels:
+        value = _roman_to_int(label)
+        if value is None:
+            return False
+        values.append(value)
+    if any(len(label) > 1 for label in labels):
+        return True
+    if len(values) >= 2:
+        return all(values[i] + 1 == values[i + 1] for i in range(len(values) - 1))
+    return False
+
+
+def _detect_list_kind(list_tag, items: list) -> str:
+    type_attr = (list_tag.get("type") or "").strip()
+    if type_attr in _OL_TYPE_TO_KIND:
+        return _OL_TYPE_TO_KIND[type_attr]
+
+    kinds: list[str] = []
+    labels: list[str] = []
+    for li in items:
+        kind, label = _classify_li_marker(_li_leading_text(li))
+        if kind == "none":
+            continue
+        kinds.append(kind)
+        if label:
+            labels.append(label)
+
+    if not kinds:
+        return "number" if list_tag.name == "ol" else "bullet"
+
+    # Resolve alpha-vs-roman for ambiguous single-letter markers like "i.".
+    if (
+        all(k in {"alpha_lower", "roman_lower"} for k in kinds)
+        and labels
+        and _looks_like_roman_sequence([lab.lower() for lab in labels])
+    ):
+        return "roman_lower"
+    if (
+        all(k in {"alpha_upper", "roman_upper"} for k in kinds)
+        and labels
+        and _looks_like_roman_sequence(labels)
+    ):
+        return "roman_upper"
+
+    # Majority vote among detected markers.
+    counts: dict[str, int] = {}
+    for kind in kinds:
+        counts[kind] = counts.get(kind, 0) + 1
+    return max(counts, key=lambda k: (counts[k], k == "number"))
+
+
+def _format_alpha_roman_marker(index: int, kind: str) -> str:
+    """1-based index → 'a. ' / 'i. ' etc."""
+    if kind == "alpha_lower":
+        return f"{_int_to_alpha(index)}. "
+    if kind == "alpha_upper":
+        return f"{_int_to_alpha(index).upper()}. "
+    if kind == "roman_lower":
+        return f"{_int_to_roman(index)}. "
+    if kind == "roman_upper":
+        return f"{_int_to_roman(index).upper()}. "
+    return ""
+
+
+def _strip_kind_marker(li_tag, kind: str) -> None:
+    if kind == "bullet":
+        if _strip_li_leading(li_tag, _LIST_BULLET_GLYPH_RE):
+            return
+        _strip_li_leading(li_tag, _LIST_DASH_BULLET_RE)
+        return
+    if kind == "number":
+        _strip_li_leading(li_tag, _LIST_NUMBER_MARKER_RE)
+        return
+    if kind == "alpha_lower":
+        _strip_li_leading(li_tag, _LIST_ALPHA_LOWER_MARKER_RE)
+        return
+    if kind == "alpha_upper":
+        _strip_li_leading(li_tag, _LIST_ALPHA_UPPER_MARKER_RE)
+        return
+    if kind == "roman_lower":
+        # Also catches single-letter roman that classified as alpha.
+        if not _strip_li_leading(li_tag, _LIST_ROMAN_LOWER_MARKER_RE):
+            _strip_li_leading(li_tag, _LIST_ALPHA_LOWER_MARKER_RE)
+        return
+    if kind == "roman_upper":
+        if not _strip_li_leading(li_tag, _LIST_ROMAN_UPPER_MARKER_RE):
+            _strip_li_leading(li_tag, _LIST_ALPHA_UPPER_MARKER_RE)
+
+
+def _li_has_kind_marker(li_tag, kind: str) -> bool:
+    found, label = _classify_li_marker(_li_leading_text(li_tag))
+    if found == kind:
+        return True
+    if kind == "roman_lower" and found == "alpha_lower":
+        return bool(label and _roman_to_int(label) is not None)
+    if kind == "roman_upper" and found == "alpha_upper":
+        return bool(label and _roman_to_int(label) is not None)
+    return False
+
+
+def cleanup_list_markers_html(soup: BeautifulSoup) -> None:
+    """
+    Normalize list marker semantics before markdownify:
+
+    - bullet lists → <ul>, strip source glyphs (markdown uses *)
+    - numeric lists → <ol>, strip in-text 1./1) (markdown uses 1. 2. 3.)
+    - alphabetic / roman lists → <ul>, keep/add a./i. labels so markdown
+      becomes "* a. …" / "* i. …"
+    """
+    lists = list(soup.find_all(["ul", "ol"]))
+    lists.sort(key=lambda tag: len(list(tag.parents)), reverse=True)
+
+    for list_tag in lists:
+        items = _direct_list_items(list_tag)
+        if not items:
+            continue
+        kind = _detect_list_kind(list_tag, items)
+
+        if kind == "number":
+            list_tag.name = "ol"
+            if "type" in list_tag.attrs:
+                del list_tag.attrs["type"]
+            for li in items:
+                _strip_kind_marker(li, "number")
+            continue
+
+        if kind in {"alpha_lower", "alpha_upper", "roman_lower", "roman_upper"}:
+            list_tag.name = "ul"
+            if "type" in list_tag.attrs:
+                del list_tag.attrs["type"]
+            for index, li in enumerate(items, start=1):
+                if _li_has_kind_marker(li, kind):
+                    continue
+                # No usable source label — synthesize one, then done.
+                # If a mismatched leftover bullet/number sits at the front, drop it.
+                leading_kind, _ = _classify_li_marker(_li_leading_text(li))
+                if leading_kind in {"bullet", "number"}:
+                    _strip_kind_marker(li, leading_kind)
+                _prepend_li_text(li, _format_alpha_roman_marker(index, kind))
+            continue
+
+        # bullet (default)
+        list_tag.name = "ul"
+        if "type" in list_tag.attrs:
+            del list_tag.attrs["type"]
+        for li in items:
+            _strip_kind_marker(li, "bullet")
+
+
 def normalize_list_html(html: str) -> str:
     """
     Fix Marker list HTML so markdownify can emit proper nested markdown lists.
 
     Marker often encodes indented items as sibling <ul><li class="list-indent-N">
     inside the parent <ul>. Nest those under the previous <li> instead.
-    Also wrap runs of orphan <li> tags in a <ul>.
+    Also wrap runs of orphan <li> tags in a <ul>, then normalize source markers.
     """
     soup = BeautifulSoup(html or "", "html.parser")
 
@@ -1419,18 +1769,64 @@ def normalize_list_html(html: str) -> str:
                 wrapper.append(item.extract())
         i = j if j > i else i + 1
 
+    cleanup_list_markers_html(soup)
     return str(soup)
 
 
 def normalize_list_markdown(text: str) -> str:
-    """Tighten spacing around markdown list blocks."""
+    """Normalize list markers and tighten spacing around markdown list blocks."""
+    # Unordered lists always use asterisks (not - or +).
+    text = re.sub(r"(?m)^([ \t]*)[-+] ", r"\1* ", text)
     # Remove blank lines between consecutive list items.
     text = re.sub(
-        r"(?m)^([ \t]*(?:[-*+] |\d+\. ).+)\n\n+(?=[ \t]*(?:[-*+] |\d+\. ))",
+        r"(?m)^([ \t]*(?:\* |\d+\. ).+)\n\n+(?=[ \t]*(?:\* |\d+\. ))",
         r"\1\n",
         text,
     )
     return text
+
+
+_ATX_HEADING_RE = re.compile(r"^(#+)\s+(.+?)\s*$")
+
+
+def combine_consecutive_headings(text: str) -> str:
+    """
+    Merge runs of same-level ATX headings that have only blank lines between them.
+
+    Datalab often splits a multi-line title into adjacent SectionHeader blocks
+    (e.g. "## Chapter One" then "## The Beginning"); join those into one heading.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        match = _ATX_HEADING_RE.match(lines[i])
+        if not match:
+            out.append(lines[i])
+            i += 1
+            continue
+
+        level = match.group(1)
+        titles = [match.group(2).strip()]
+        i += 1
+
+        while i < n:
+            # Peek past blank lines for another heading at the same level.
+            k = i
+            while k < n and not lines[k].strip():
+                k += 1
+            if k >= n:
+                break
+            nxt = _ATX_HEADING_RE.match(lines[k])
+            if not nxt or nxt.group(1) != level:
+                break
+            titles.append(nxt.group(2).strip())
+            i = k + 1  # consume intervening blanks + heading
+
+        out.append(f"{level} {' | '.join(titles)}")
+
+    return "\n".join(out)
 
 
 _FIGURE_BLOCK_RE = re.compile(r"<figure\b.*?</figure>", re.IGNORECASE | re.DOTALL)
@@ -1451,7 +1847,7 @@ def html_to_markdown(html: str) -> str:
     html = normalize_list_html(html)
     converter = MarkdownConverter(
         heading_style="ATX",
-        bullets="-",
+        bullets="*",
         escape_misc=False,
         escape_underscores=True,
         escape_asterisks=True,
@@ -1460,6 +1856,7 @@ def html_to_markdown(html: str) -> str:
     markdown = converter.convert(html)
     markdown = html_emphasis_tags_to_markdown(markdown)
     markdown = normalize_list_markdown(markdown)
+    markdown = combine_consecutive_headings(markdown)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
 
     if figures:
