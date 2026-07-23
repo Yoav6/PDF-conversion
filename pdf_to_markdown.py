@@ -6,12 +6,7 @@ Or open an existing Datalab JSON file and convert it to Markdown only.
 API docs: https://documentation.datalab.to/docs/welcome/api
 Reads the API key from datalab_api_key.txt (or DATALAB_API_KEY env var).
 
-Run the GUI (default):  python3 pdf_to_markdown.py
-Run the CLI:            python3 pdf_to_markdown.py --cli
-CLI base64 images:      python3 pdf_to_markdown.py --cli --base64-images
-CLI without images:     python3 pdf_to_markdown.py --cli --no-images
-CLI cover page:         python3 pdf_to_markdown.py --cli --cover-page 2
-CLI without cover:      python3 pdf_to_markdown.py --cli --no-cover
+Run the GUI:  python3 pdf_to_markdown.py
 """
 
 from __future__ import annotations
@@ -22,7 +17,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
@@ -51,7 +45,7 @@ EXTRACT_COVER = True
 COVER_PAGE_DEFAULT = 1
 COVER_IMAGE_STEM = "cover"
 COVER_IMAGE_DPI = 200
-# Default markdown image style when not overridden by UI/CLI.
+# Default markdown image style when not overridden by the UI.
 # False → relative links (images/foo.jpg); True → data:image/...;base64,...
 EMBED_IMAGES_AS_BASE64 = True
 # Indented-paragraph (blockquote) detection.
@@ -182,53 +176,6 @@ def parse_page_range(page_range: str | None) -> str | None:
             "Use forms like 0-10 or 0-5,10,15-20 (0-indexed)."
         )
     return re.sub(r"\s+", "", page_range)
-
-
-def prompt_page_range() -> str | None:
-    """
-    Ask which pages to convert (0-indexed, e.g. 0-10 or 0-5,10,15-20).
-
-    Empty input means the whole document. Returns None for all pages.
-    """
-    print("📄 Page range (0-indexed, e.g. 0-10 or 0-5,10,20-25).")
-    print("   Leave blank to convert all pages.")
-
-    page_range = None
-    if shutil.which("zenity"):
-        try:
-            result = subprocess.run(
-                [
-                    "zenity",
-                    "--entry",
-                    "--title=Page Range",
-                    "--text=Page range (0-indexed, e.g. 0-10). Leave blank for all pages:",
-                    "--entry-text=",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode == 0:
-                page_range = result.stdout.strip()
-            else:
-                page_range = None
-        except Exception:
-            page_range = None
-
-    if page_range is None:
-        page_range = input("Page range: ").strip()
-
-    try:
-        normalized = parse_page_range(page_range)
-    except ValueError as exc:
-        print(f"❌ {exc}")
-        sys.exit(1)
-
-    if normalized is None:
-        print("   → all pages")
-    else:
-        print(f"   → pages {normalized}")
-    return normalized
 
 
 def submit_conversion(
@@ -2316,7 +2263,7 @@ class ConversionApp(tk.Tk):
         messagebox.showinfo("API key saved", f"Saved to:\n{API_KEY_FILE}")
 
     def _browse(self) -> None:
-        """Use the same native zenity picker as the CLI."""
+        """Open a native zenity file picker."""
         try:
             path = select_file_zenity()
         except Exception as exc:
@@ -2450,73 +2397,10 @@ class ConversionApp(tk.Tk):
         messagebox.showerror("Conversion failed", str(exc))
 
 
-def main_gui() -> None:
-    app = ConversionApp()
-    app.mainloop()
-
-
-def main_cli() -> None:
-    print("📂 Opening native Linux file picker...\n")
-
-    input_path = None
-    try:
-        input_path = select_file_zenity()
-    except Exception as exc:
-        print(f"⚠ Could not open file picker: {exc}")
-
-    if input_path is None:
-        raw_path = input("Enter path to PDF or JSON file: ").strip()
-        if not raw_path:
-            print("❌ No file path provided.")
-            sys.exit(0)
-        input_path = Path(raw_path).expanduser()
-
-    if not input_path.exists():
-        print(f"❌ File not found: {input_path}")
-        sys.exit(1)
-
-    print(f"📄 Selected: {input_path.name}")
-
-    page_range = None
-    if input_path.suffix.lower() == ".pdf":
-        page_range = prompt_page_range()
-
-    embed_base64 = EMBED_IMAGES_AS_BASE64 or ("--base64-images" in sys.argv)
-    download_images = "--no-images" not in sys.argv
-
-    extract_cover = EXTRACT_COVER and ("--no-cover" not in sys.argv)
-    cover_page = COVER_PAGE_DEFAULT
-    if "--cover-page" in sys.argv:
-        idx = sys.argv.index("--cover-page")
-        try:
-            cover_page = int(sys.argv[idx + 1])
-        except (IndexError, ValueError):
-            print("❌ --cover-page requires a whole number >= 1.")
-            sys.exit(1)
-        if cover_page < 1:
-            print("❌ --cover-page must be >= 1 (1 = first page).")
-            sys.exit(1)
-
-    try:
-        run_conversion(
-            input_path,
-            page_range=page_range,
-            embed_images_as_base64=embed_base64,
-            download_images=download_images,
-            extract_cover=extract_cover,
-            cover_page=cover_page,
-        )
-    except Exception as exc:
-        print(f"❌ {exc}")
-        sys.exit(1)
-
-
 def main() -> None:
     ensure_api_key_file()
-    if "--cli" in sys.argv:
-        main_cli()
-    else:
-        main_gui()
+    app = ConversionApp()
+    app.mainloop()
 
 
 if __name__ == "__main__":

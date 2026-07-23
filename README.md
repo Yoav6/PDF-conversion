@@ -1,6 +1,6 @@
 # pdf_to_markdown
 
-Convert a PDF to clean Markdown (plus extracted images and a cover image) using the [Datalab](https://www.datalab.to) API, or convert an existing Datalab JSON export to Markdown locally. Ships with both a GUI and a CLI.
+GUI app to convert a PDF to clean Markdown (plus extracted images and a cover image) using the [Datalab](https://www.datalab.to) API, or to convert an existing Datalab JSON export to Markdown locally.
 
 Datalab handles the layout analysis and OCR; the script then does a lot of extra work on the returned document to produce Markdown that reads like a real book rather than a raw dump of detected blocks.
 
@@ -21,19 +21,18 @@ Paragraphs (and list groups) that are broken across a page boundary are merged b
 
 ### Indented quotes → blockquotes
 
-Block quotes in the original are usually typeset with a wider left margin. The script estimates each page's dominant body-text margin from block bounding boxes, and any text block indented past it by more than a threshold is rendered as a markdown blockquote (`> …`). 
+Block quotes in the original are usually typeset with a wider left margin. The script estimates each page's dominant body-text margin from block bounding boxes, and any text block indented past it by more than a threshold is rendered as a markdown blockquote (`> …`).
 
 ### Images and captions
 
-- Images are extracted and either saved to an `images/` folder (relative links) or embedded directly in the Markdown as base64 data URIs (`--base64-images`).
+- Images are extracted and either saved to an `images/` folder (relative links) or embedded directly in the Markdown as base64 data URIs.
 - Figures and their captions are paired up into a single HTML figure element, and a standalone caption block that follows an image is attached to it.
-- Datalab's AI-generated image captions are disabled (`DISABLE_IMAGE_CAPTIONS`) so only real captions from the document are used. 
-- Image extraction can be turned off
-  entirely with `--no-images`.
+- Datalab's AI-generated image captions are disabled (`DISABLE_IMAGE_CAPTIONS`) so only real captions from the document are used.
+- Image extraction can be turned off in the GUI.
 
 ### Cover image
 
-One PDF page (the first by default) is rendered to an image via poppler and saved into the output folder as the cover. The page number is configurable in the GUI or with `--cover-page N`, and it can be disabled in the GUI or with `--no-cover`.
+One PDF page (the first by default) is rendered to an image via poppler and saved into the output folder as the cover. The page number is configurable in the GUI, and cover extraction can be disabled there as well.
 
 ### List and heading cleanup
 
@@ -60,39 +59,18 @@ pip install requests beautifulsoup4 markdownify
 ## Setup
 
 You need a Datalab API key — get one at
-[datalab.to/app/keys](https://www.datalab.to/app/keys). The easiest way to set it is
-through the GUI: launch the app and click the **API Key…** button to enter and save
-your key.
-
-The key is stored in `datalab_api_key.txt` 
+[datalab.to/app/keys](https://www.datalab.to/app/keys). Launch the app and click **API Key…** to enter and save your key, or put it in `datalab_api_key.txt` / set `DATALAB_API_KEY`.
 
 ## Usage
-
-Run the GUI (default):
 
 ```bash
 python3 pdf_to_markdown.py
 ```
 
-Or use the CLI:
-
-```bash
-python3 pdf_to_markdown.py --cli                 # convert with default settings
-python3 pdf_to_markdown.py --cli --base64-images # embed images as base64 data URIs
-python3 pdf_to_markdown.py --cli --no-images     # skip image extraction
-python3 pdf_to_markdown.py --cli --cover-page 2  # render page 2 as the cover
-python3 pdf_to_markdown.py --cli --no-cover      # don't extract a cover image
-```
-
-You can select either a PDF (sent to Datalab for conversion) or an existing Datalab
-JSON export (converted to Markdown locally). For PDFs you can specify a page range.
-Output is written to a folder next to the source file, containing the Markdown and an
-`images/` directory.
+In the GUI, select a PDF (sent to Datalab) or an existing Datalab JSON export (converted locally). For PDFs you can set a page range, choose how images are handled, and control cover extraction. Output is written to a folder next to the source file, containing the Markdown and an `images/` directory. Progress also logs to the terminal.
 
 ## Notes
 
-- The script uses a native Zenity file picker, and falls back to a text prompt if
-  Zenity is unavailable.
-- Conversion behaviour (mode, image handling, quote/indent detection, cover DPI,
-  etc.) can be tuned via the constants in the `CONFIGURATION` section near the top of
-  `pdf_to_markdown.py`.
+- The Browse button uses a native Zenity file picker.
+- Conversion behaviour (mode, image handling, quote/indent detection, cover DPI, etc.) can be tuned via the constants in the `CONFIGURATION` section near the top of `pdf_to_markdown.py`.
+- Optional helpers live in `Additional scripts/` (`fix_markdown.py`, `md_to_epub.py`, `renumber_references.py`).
