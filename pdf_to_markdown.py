@@ -52,14 +52,14 @@ COVER_IMAGE_DPI = 200
 # Default markdown image style when not overridden by the UI.
 # False → relative links (images/foo.jpg); True → data:image/...;base64,...
 EMBED_IMAGES_AS_BASE64 = True
-# Indented-paragraph (blockquote) detection.
-# Datalab gives every block a bbox in PDF points; a text block whose left edge is
-# indented past the page's dominant body-text margin is treated as a quote and
-# rendered with a leading "> " in the Markdown.
+# Indented-paragraph detection.
+# Datalab gives every block a bbox in PDF points. A text block whose left edge is
+# indented past the page's dominant body-text margin is rendered with "> " in Markdown.
 DETECT_INDENTED_QUOTES = True
-# Minimum indent (relative to the body margin) to count as a quote, expressed as
+# Minimum indent (relative to the body margin) to count as indented, expressed as
 # a fraction of the page width and as an absolute floor in points (larger wins).
-QUOTE_INDENT_MIN_FRACTION = 0.02
+# 0.0194 catches ~25pt indents on typical 1288pt-wide pages (just under 0.02).
+QUOTE_INDENT_MIN_FRACTION = 0.0194
 QUOTE_INDENT_MIN_POINTS = 12.0
 API_KEY_FILE = Path(__file__).resolve().parent / "datalab_api_key.txt"
 API_KEY_PLACEHOLDER = "YOUR_API_KEY_HERE"
@@ -67,6 +67,22 @@ API_KEY_FILE_TEMPLATE = (
     "# Paste your Datalab API key on the next line (replace the placeholder).\n"
     "# Get a key at: https://www.datalab.to/app/keys\n"
     f"{API_KEY_PLACEHOLDER}\n"
+)
+# Empty YAML keys written at the top of every Markdown file.
+# cover-image is filled first when a cover was extracted.
+YAML_FRONTMATTER_KEYS = (
+    "cover-image",
+    "isbn",
+    "title",
+    "subtitle",
+    "author",
+    "identifier",
+    "language",
+    "publisher",
+    "pubdate",
+    "description",
+    "series",
+    "series_index",
 )
 # ================================================================
 
@@ -402,22 +418,7 @@ def cover_image_yaml_value(
     return f"{rel_images}/{filename}"
 
 
-# Empty YAML keys written at the top of every Markdown file.
-# cover-image is filled first when a cover was extracted.
-YAML_FRONTMATTER_KEYS = (
-    "cover-image",
-    "isbn",
-    "title",
-    "subtitle",
-    "author",
-    "identifier",
-    "language",
-    "publisher",
-    "pubdate",
-    "description",
-    "series",
-    "series_index",
-)
+
 
 
 def prepend_yaml_frontmatter(markdown: str, cover_image: str | None = None) -> str:
@@ -718,7 +719,7 @@ def is_indented_quote(
     margin: float | None,
     threshold: float,
 ) -> bool:
-    """True if a text block is indented past the body margin by >= threshold."""
+    """True if a text block is indented past the page body margin by >= threshold."""
     if margin is None or block_type not in _QUOTE_CANDIDATE_TYPES:
         return False
     bbox = block_bbox(child)
