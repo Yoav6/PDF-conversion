@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -39,8 +40,10 @@ SKIP_CACHE = False
 POLL_INTERVAL_SEC = 2
 MAX_POLLS = 300
 IMAGES_DIR_NAME = "images"
-# Cover extraction: render one PDF page (1-indexed) to an image, saved into the
-# images folder separately from the Datalab pipeline.
+# Cover extraction: render one PDF page (1-indexed) separately from Datalab.
+# The image is written to YAML `cover-image` (base64 or a relative link).
+# It is saved to images/ only when download_images is on. Requires either
+# download_images or embed-as-base64; otherwise the UI disables the option.
 EXTRACT_COVER = True
 COVER_PAGE_DEFAULT = 1
 COVER_IMAGE_STEM = "cover"
@@ -161,9 +164,12 @@ _PAGE_RANGE_RE = re.compile(
 
 def parse_page_range(page_range: str | None) -> str | None:
     """
-    Normalize a page-range string. Empty/None means all pages.
+    Normalize a page-range string and convert from 1-indexed user input
+    to the 0-indexed form expected by Datalab.
 
-    Raises ValueError if the format is invalid.
+    Empty/None means all pages. Raises ValueError if the format is invalid.
+    Page numbers are treated as 1-indexed and converted to 0-indexed for
+    Datalab, except 0 which is left as-is.
     """
     if page_range is None:
         return None
@@ -173,9 +179,14 @@ def parse_page_range(page_range: str | None) -> str | None:
     if not _PAGE_RANGE_RE.match(page_range):
         raise ValueError(
             f"Invalid page range: {page_range!r}. "
-            "Use forms like 0-10 or 0-5,10,15-20 (0-indexed)."
+            "Use forms like 1-10 or 1-5,10,15-20 (1-indexed)."
         )
-    return re.sub(r"\s+", "", page_range)
+
+    def to_zero_indexed(match: re.Match[str]) -> str:
+        n = int(match.group(0))
+        return str(n if n == 0 else n - 1)
+
+    return re.sub(r"\d+", to_zero_indexed, re.sub(r"\s+", "", page_range))
 
 
 def submit_conversion(
@@ -312,63 +323,88 @@ def save_images(images: dict[str, bytes], images_dir: Path) -> None:
         (images_dir / safe_name).write_bytes(data)
 
 
-def extract_cover_image(
+def cover_image_filename() -> str:
+    return f"{COVER_IMAGE_STEM}.jpg"
+
+
+def render_cover_jpeg(
     pdf_path: Path,
-    images_dir: Path,
     cover_page: int = COVER_PAGE_DEFAULT,
     *,
     dpi: int = COVER_IMAGE_DPI,
-) -> Path:
+) -> bytes:
     """
-    Render a single PDF page to an image and save it into ``images_dir``.
+    Render a single PDF page to JPEG bytes.
 
     Uses poppler's pdftoppm (falling back to pdftocairo). ``cover_page`` is
-    1-indexed (1 = first page). Returns the saved image path. Raises on failure.
+    1-indexed (1 = first page). Raises on failure.
     """
     if cover_page < 1:
         raise ValueError(f"Cover page must be >= 1 (got {cover_page}).")
 
-    images_dir.mkdir(parents=True, exist_ok=True)
-    out_prefix = images_dir / COVER_IMAGE_STEM
-    out_path = images_dir / f"{COVER_IMAGE_STEM}.jpg"
-
-    # Both tools write <prefix>.jpg when given -singlefile.
     candidates = [
         ("pdftoppm", ["-jpeg"]),
         ("pdftocairo", ["-jpeg"]),
     ]
     last_error: str | None = None
-    for tool, fmt_args in candidates:
-        if not shutil.which(tool):
-            continue
-        cmd = [
-            tool,
-            "-f", str(cover_page),
-            "-l", str(cover_page),
-            "-singlefile",
-            *fmt_args,
-            "-r", str(dpi),
-            str(pdf_path),
-            str(out_prefix),
-        ]
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        out_prefix = tmp_dir / COVER_IMAGE_STEM
+        out_path = tmp_dir / cover_image_filename()
+        for tool, fmt_args in candidates:
+            if not shutil.which(tool):
+                continue
+            cmd = [
+                tool,
+                "-f", str(cover_page),
+                "-l", str(cover_page),
+                "-singlefile",
+                *fmt_args,
+                "-r", str(dpi),
+                str(pdf_path),
+                str(out_prefix),
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120
+                )
+            except Exception as exc:
+                last_error = f"{tool}: {exc}"
+                continue
+            if result.returncode == 0 and out_path.is_file():
+                return out_path.read_bytes()
+            last_error = (
+                f"{tool} exited {result.returncode}: "
+                f"{(result.stderr or result.stdout).strip()}"
             )
-        except Exception as exc:
-            last_error = f"{tool}: {exc}"
-            continue
-        if result.returncode == 0 and out_path.is_file():
-            return out_path
-        last_error = (
-            f"{tool} exited {result.returncode}: "
-            f"{(result.stderr or result.stdout).strip()}"
-        )
 
     raise RuntimeError(
         "Could not extract cover image. Install poppler (pdftoppm/pdftocairo)."
         + (f" Last error: {last_error}" if last_error else "")
     )
+
+
+def cover_image_yaml_value(
+    cover_bytes: bytes,
+    *,
+    embed_base64: bool,
+    images_dir: Path,
+    md_path: Path,
+) -> str:
+    """Return the YAML ``cover-image`` value: a data URI or a relative link."""
+    filename = cover_image_filename()
+    if embed_base64:
+        b64 = base64.b64encode(cover_bytes).decode("ascii")
+        mime = image_mime_type(Path(filename))
+        return f"data:{mime};base64,{b64}"
+    rel_images = Path(os.path.relpath(images_dir, md_path.parent)).as_posix()
+    return f"{rel_images}/{filename}"
+
+
+def prepend_cover_yaml(markdown: str, cover_image: str) -> str:
+    """Put a YAML frontmatter block with ``cover-image`` at the top of the file."""
+    quoted = json.dumps(cover_image, ensure_ascii=False)
+    return f"---\ncover-image: {quoted}\n---\n\n{markdown.lstrip()}"
 
 
 def as_block(node) -> SimpleNamespace | None:
@@ -1834,6 +1870,7 @@ def convert_json_to_markdown(
     embed_images_as_base64: bool = False,
     download_images: bool = True,
     images: dict[str, bytes] | None = None,
+    cover_image: str | None = None,
     progress: ProgressFn | None = None,
 ) -> bool:
     """Write markdown next to the source. Returns True if image links were rewritten."""
@@ -1871,6 +1908,9 @@ def convert_json_to_markdown(
     markdown = html_to_markdown(html)
     markdown = finalize_footnote_refs(markdown)
     markdown = append_footnotes_section(markdown, footnotes)
+    if cover_image:
+        markdown = prepend_cover_yaml(markdown, cover_image)
+        print("🖼️  Wrote cover-image YAML frontmatter")
     md_path.write_text(markdown, encoding="utf-8")
 
     if footnotes or marker_count:
@@ -1977,11 +2017,26 @@ def process_pdf(
     elif not images:
         print("ℹ️  No images in response.")
 
-    if extract_cover:
+    cover_yaml: str | None = None
+    do_cover = extract_cover and (download_images or embed_images_as_base64)
+    if do_cover:
         report_progress(progress, 85, f"Extracting cover (page {cover_page})…")
         try:
-            cover_path = extract_cover_image(pdf_path, images_dir, cover_page)
-            print(f"🖼️  Saved cover (page {cover_page}) → {IMAGES_DIR_NAME}/{cover_path.name}")
+            cover_bytes = render_cover_jpeg(pdf_path, cover_page)
+            if download_images:
+                images_dir.mkdir(parents=True, exist_ok=True)
+                cover_path = images_dir / cover_image_filename()
+                cover_path.write_bytes(cover_bytes)
+                print(
+                    f"🖼️  Saved cover (page {cover_page}) → "
+                    f"{IMAGES_DIR_NAME}/{cover_path.name}"
+                )
+            cover_yaml = cover_image_yaml_value(
+                cover_bytes,
+                embed_base64=embed_images_as_base64,
+                images_dir=images_dir,
+                md_path=md_path,
+            )
         except Exception as exc:
             print(f"⚠ Cover extraction failed: {exc}")
 
@@ -1993,6 +2048,7 @@ def process_pdf(
         embed_images_as_base64=embed_images_as_base64,
         download_images=download_images,
         images=images,
+        cover_image=cover_yaml,
         progress=progress,
     )
 
@@ -2176,7 +2232,7 @@ class ConversionApp(tk.Tk):
         self._page_entry.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             page_row,
-            text="0-indexed, e.g. 0-10 — leave blank for all (PDF only)",
+            text="1-indexed, e.g. 1-10 — leave blank for all (PDF only)",
             foreground="#555",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -2191,6 +2247,7 @@ class ConversionApp(tk.Tk):
             root,
             text="Embed images as base64 in markdown",
             variable=self._base64_var,
+            command=self._sync_image_options,
         )
         self._base64_check.grid(row=3, column=1, sticky="w", **pad)
 
@@ -2211,9 +2268,11 @@ class ConversionApp(tk.Tk):
             textvariable=self._cover_page_var,
         )
         self._cover_page_entry.grid(row=0, column=1, sticky="w", padx=(6, 0))
-        ttk.Label(cover_row, text="(1 = first page; PDF only)", foreground="#555").grid(
-            row=0, column=2, sticky="w", padx=(8, 0)
-        )
+        ttk.Label(
+            cover_row,
+            text="(1 = first page; PDF only; needs download or base64)",
+            foreground="#555",
+        ).grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         action_row = ttk.Frame(root)
         action_row.grid(row=5, column=0, columnspan=2, sticky="ew", **pad)
@@ -2281,18 +2340,29 @@ class ConversionApp(tk.Tk):
             self._page_range_var.set("")
         self._sync_cover_state()
 
-    def _sync_cover_state(self) -> None:
-        # Cover extraction needs a source PDF; disable for JSON input.
+    def _cover_available(self) -> bool:
         path = self._file_var.get().strip()
         is_pdf = path.lower().endswith(".pdf") or path == ""
-        self._cover_check.configure(state="normal" if is_pdf else "disabled")
-        entry_state = "normal" if (is_pdf and self._extract_cover_var.get()) else "disabled"
+        has_image_output = bool(
+            self._download_images_var.get() or self._base64_var.get()
+        )
+        return is_pdf and has_image_output
+
+    def _sync_cover_state(self) -> None:
+        # Cover needs a PDF plus either a saved file or a base64 embed target.
+        available = self._cover_available()
+        self._cover_check.configure(state="normal" if available else "disabled")
+        entry_state = (
+            "normal"
+            if available and self._extract_cover_var.get()
+            else "disabled"
+        )
         self._cover_page_entry.configure(state=entry_state)
 
     def _sync_image_options(self) -> None:
-        # base64 embedding works whether or not images are downloaded to disk,
-        # so the checkbox stays enabled either way; this keeps that intent clear.
+        # base64 embedding works whether or not images are downloaded to disk.
         self._base64_check.configure(state="normal")
+        self._sync_cover_state()
 
     def _set_progress(self, percent: float, message: str) -> None:
         self._progress_var.set(percent)
@@ -2326,7 +2396,13 @@ class ConversionApp(tk.Tk):
         else:
             page_range = None
 
-        extract_cover = is_pdf and bool(self._extract_cover_var.get())
+        embed_base64 = bool(self._base64_var.get())
+        download_images = bool(self._download_images_var.get())
+        extract_cover = (
+            is_pdf
+            and bool(self._extract_cover_var.get())
+            and (embed_base64 or download_images)
+        )
         cover_page = COVER_PAGE_DEFAULT
         if extract_cover:
             try:
@@ -2343,9 +2419,6 @@ class ConversionApp(tk.Tk):
         self._running = True
         self._convert_btn.configure(state="disabled")
         self._set_progress(0, "Starting…")
-
-        embed_base64 = bool(self._base64_var.get())
-        download_images = bool(self._download_images_var.get())
         thread = threading.Thread(
             target=self._run_worker,
             args=(

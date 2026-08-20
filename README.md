@@ -25,14 +25,14 @@ Block quotes in the original are usually typeset with a wider left margin. The s
 
 ### Images and captions
 
-- Images are extracted and either saved to an `images/` folder (relative links) or embedded directly in the Markdown as base64 data URIs.
+- Images are extracted and can be saved to an `images/` folder (relative links) and/or embedded directly in the Markdown as base64 data URIs.
 - Figures and their captions are paired up into a single HTML figure element, and a standalone caption block that follows an image is attached to it.
 - Datalab's AI-generated image captions are disabled (`DISABLE_IMAGE_CAPTIONS`) so only real captions from the document are used.
 - Image extraction can be turned off in the GUI.
 
 ### Cover image
 
-One PDF page (the first by default) is rendered to an image via poppler and saved into the output folder as the cover. The page number is configurable in the GUI, and cover extraction can be disabled there as well.
+When **Extract cover** is on, one page is rendered via poppler and written into YAML frontmatter at the top of the Markdown as `cover-image`. That property is a base64 data URI if **Embed images as base64** is selected, otherwise a relative link (`images/cover.jpg`). The cover file is saved to `images/` only when **Download images** is selected. If both of those image options are off, extract cover is unavailable in the GUI and is skipped. 
 
 ### List and heading cleanup
 
