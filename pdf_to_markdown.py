@@ -41,9 +41,10 @@ POLL_INTERVAL_SEC = 2
 MAX_POLLS = 300
 IMAGES_DIR_NAME = "images"
 # Cover extraction: render one PDF page (1-indexed) separately from Datalab.
-# The image is written to YAML `cover-image` (base64 or a relative link).
-# It is saved to images/ only when download_images is on. Requires either
-# download_images or embed-as-base64; otherwise the UI disables the option.
+# Every Markdown file gets YAML frontmatter; cover-image is filled when
+# extract_cover is on. The cover file is saved to images/ only when
+# download_images is on. Requires either download_images or embed-as-base64;
+# otherwise the UI disables the option.
 EXTRACT_COVER = True
 COVER_PAGE_DEFAULT = 1
 COVER_IMAGE_STEM = "cover"
@@ -401,10 +402,35 @@ def cover_image_yaml_value(
     return f"{rel_images}/{filename}"
 
 
-def prepend_cover_yaml(markdown: str, cover_image: str) -> str:
-    """Put a YAML frontmatter block with ``cover-image`` at the top of the file."""
-    quoted = json.dumps(cover_image, ensure_ascii=False)
-    return f"---\ncover-image: {quoted}\n---\n\n{markdown.lstrip()}"
+# Empty YAML keys written at the top of every Markdown file.
+# cover-image is filled first when a cover was extracted.
+YAML_FRONTMATTER_KEYS = (
+    "cover-image",
+    "isbn",
+    "title",
+    "subtitle",
+    "author",
+    "identifier",
+    "language",
+    "publisher",
+    "pubdate",
+    "description",
+    "series",
+    "series_index",
+)
+
+
+def prepend_yaml_frontmatter(markdown: str, cover_image: str | None = None) -> str:
+    """Put the standard YAML frontmatter block at the top of the file."""
+    lines = ["---"]
+    for key in YAML_FRONTMATTER_KEYS:
+        if key == "cover-image" and cover_image:
+            lines.append(f"{key}: {json.dumps(cover_image, ensure_ascii=False)}")
+        else:
+            lines.append(f"{key}:")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines) + "\n" + markdown.lstrip()
 
 
 def as_block(node) -> SimpleNamespace | None:
@@ -1908,9 +1934,9 @@ def convert_json_to_markdown(
     markdown = html_to_markdown(html)
     markdown = finalize_footnote_refs(markdown)
     markdown = append_footnotes_section(markdown, footnotes)
+    markdown = prepend_yaml_frontmatter(markdown, cover_image)
     if cover_image:
-        markdown = prepend_cover_yaml(markdown, cover_image)
-        print("🖼️  Wrote cover-image YAML frontmatter")
+        print("🖼️  Wrote cover-image into YAML frontmatter")
     md_path.write_text(markdown, encoding="utf-8")
 
     if footnotes or marker_count:

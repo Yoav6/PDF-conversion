@@ -30,9 +30,11 @@ Block quotes in the original are usually typeset with a wider left margin. The s
 - Datalab's AI-generated image captions are disabled (`DISABLE_IMAGE_CAPTIONS`) so only real captions from the document are used.
 - Image extraction can be turned off in the GUI.
 
-### Cover image
+### Cover image and YAML frontmatter
 
-When **Extract cover** is on, one page is rendered via poppler and written into YAML frontmatter at the top of the Markdown as `cover-image`. That property is a base64 data URI if **Embed images as base64** is selected, otherwise a relative link (`images/cover.jpg`). The cover file is saved to `images/` only when **Download images** is selected. If both of those image options are off, extract cover is unavailable in the GUI and is skipped. 
+Every Markdown file starts with empty YAML properties (`cover-image`, `isbn`, `title`, `subtitle`, `author`, `identifier`, `language`, `publisher`, `pubdate`, `description`, `series`, `series_index`) for Obsidian / Readest metadata.
+
+When **Extract cover** is on (PDF input only), one page (the first by default) is rendered via poppler and written into the first property, `cover-image`. That value is a base64 data URI if **Embed images as base64** is selected, otherwise a relative link (`images/cover.jpg`). The cover file is saved to `images/` only when **Download images** is selected. If both of those image options are off, extract cover is unavailable in the GUI and is skipped. 
 
 ### List and heading cleanup
 
