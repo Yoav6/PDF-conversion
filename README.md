@@ -12,7 +12,9 @@ The markdown is formatted to work with [Obsidian](https://obsidian.md) and [Read
 
 - Inline footnote markers (`<sup>1</sup>`) in the body are converted to Pandoc-style references (`[^1]`), renumbered consecutively in the order they appear.
 - Footnote blocks are pulled out of the page flow and collected into a single `# Footnotes` section at the end of the document as `[^n]:` definitions.
-- Footnotes split across a page break are detected (a continuation block has no leading marker) and stitched back into a single note, handling hyphenated and mid-sentence breaks.
+- A block is a new note if it starts with `<sup>n</sup>`, `n.` / `n)`, a bare number plus text (`1 ברור`), or `*` / `**`. Blocks with no marker are treated as page-break continuations and stitched back (including hyphenated and mid-sentence breaks). A leading 4-digit year is not treated as a note number unless it continues the sequence.
+- A single Footnote block that already contains several notes (for example `<sup>227</sup>…<br/><sup>228</sup>…`) is split into separate definitions.
+- After a "Notes" / "Endnotes" heading, following paragraphs and list items are collected as definitions and omitted from the body, so chapter endnotes pair with in-text markers. Superscripts inside those sections are not counted as body refs. In-text `*` / `**` markers (e.g. `Harrison,*`) and their asterisk notes are numbered in the same sequence as superscripts, in the order they appear in the body.
 
 ### Paragraph merging across pages
 
@@ -69,7 +71,7 @@ You need a Datalab API key — get one at
 python3 pdf_to_markdown.py
 ```
 
-In the GUI, select a PDF (sent to Datalab) or an existing Datalab JSON export (converted locally). For PDFs you can set a page range, choose how images are handled, and control cover extraction. Output is written to a folder next to the source file, containing the Markdown and an `images/` directory. Progress also logs to the terminal.
+In the GUI, select a PDF (sent to Datalab) or an existing Datalab JSON export (converted locally). For PDFs you can set a page range, choose how images are handled, and control cover extraction. Output goes in a folder named after the source file (created next to it, and the PDF/JSON is moved in, unless that folder already exists and already contains the file). Markdown and an `images/` directory are written there. Progress also logs to the terminal.
 
 ## Notes
 

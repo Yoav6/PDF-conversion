@@ -528,78 +528,152 @@ def iter_pages(document_json) -> list:
 
 
 _FOOTNOTE_MARKER_HTML = re.compile(
-    r"^\s*<sup>\s*\d+\s*</sup>",
+    r"^\s*<sup>\s*(\d+)\s*</sup>",
     re.IGNORECASE,
 )
-_FOOTNOTE_MARKER_PLAIN = re.compile(
-    r"^\s*(?:\d+\s*[.)]|\[\^\d+\])",
-)
-_LEADING_MARKER_STRIP = re.compile(
-    r"^\s*(?:"
+_FOOTNOTE_STAR_PLAIN = re.compile(r"^\s*(\*{1,2})(?!\*)")
+_FOOTNOTE_DOTTED_PLAIN = re.compile(r"^\s*(\d+)\s*[.)]")
+_FOOTNOTE_BARE_PLAIN = re.compile(r"^\s*(\d+)\s+\S")
+_FOOTNOTE_CITE_PLAIN = re.compile(r"^\s*\[\^(\d+)\]")
+_LEADING_NUMBER_STRIP = (
     r"<sup>\s*\d+\s*</sup>|"
     r"\d+\s*[.)]|"
-    r"\[\^\d+\]\s*:?"
-    r")\s*",
+    r"\[\^\d+\]\s*:?|"
+    r"\d+(?=\s+\S)"
+)
+_LEADING_MARKER_STRIP_HTML = re.compile(
+    r"^\s*(?:\*{1,2}(?!\*)|" + _LEADING_NUMBER_STRIP + r")\s*",
+    re.IGNORECASE,
+)
+# Markdown pass: never strip '*' — that would eat italic *Ibid.*
+_LEADING_MARKER_STRIP_MD = re.compile(
+    r"^\s*(?:" + _LEADING_NUMBER_STRIP + r")\s*",
     re.IGNORECASE,
 )
 _BODY_SUP_MARKER = re.compile(r"<sup>\s*(\d+)\s*</sup>", re.IGNORECASE)
 _FN_PLACEHOLDER = re.compile(r"%%FNREF(\d+)%%")
+_STAR_PLACEHOLDER = re.compile(r"%%STARREF(\d+)%%")
+_MARK_PLACEHOLDER = re.compile(r"%%(NREF|STARREF)(\d+)%%")
+# In-text * / ** footnote markers sit after a word or punctuation (Harrison,* / justified.*).
+# Leading * at the start of a paragraph is the note itself, not a body ref.
+_BODY_STAR_MARKER = re.compile(
+    r"(?<=[\w.,;:!?\"'”’\)\]\}])(\*{1,2})(?!\*)"
+)
+_BR_TAG = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_NOTES_HEADING = re.compile(
+    r"^(notes|endnotes|end[\s-]?notes|footnotes)(?:\s+to\b.*)?$",
+    re.IGNORECASE,
+)
+_HEBREW_NOTES_HEADINGS = frozenset({"הערות", "הערות שוליים", "הערות סוף"})
+_ENDNOTE_BLOCK_TYPES = frozenset({"Text", "TextInlineMath", "ListGroup"})
+_YEARISH_NOTE_NUMBER = range(1000, 2100)
 
 
 def html_to_plain_text(html: str) -> str:
     return BeautifulSoup(html or "", "html.parser").get_text(" ", strip=True)
 
 
-def starts_with_footnote_marker(text: str) -> bool:
-    """True if this footnote block begins a new note (has a leading marker)."""
-    if not text or not text.strip():
-        return False
-    if _FOOTNOTE_MARKER_HTML.match(text):
-        return True
-    # Marker often wraps content: <p><sup>1</sup> …</p>
-    soup = BeautifulSoup(text, "html.parser")
+def _sup_is_leading_marker(soup: BeautifulSoup) -> re.Match | None:
+    """Return a digit match if the first <sup> is a leading footnote marker."""
     first_sup = soup.find("sup")
-    if first_sup is not None:
-        # Treat as a leading marker if nothing but whitespace precedes it.
-        before = ""
-        for el in first_sup.previous_elements:
-            if getattr(el, "name", None) in {None, "p", "div", "span"}:
-                chunk = str(el) if isinstance(el, str) else ""
-                if getattr(el, "name", None):
-                    continue
-                before = chunk + before
-            else:
-                break
-        if before.strip() == "" and re.fullmatch(r"\s*\d+\s*", first_sup.get_text()):
-            return True
-    plain = soup.get_text(" ", strip=False)
-    return bool(_FOOTNOTE_MARKER_PLAIN.match(plain))
+    if first_sup is None:
+        return None
+    num_match = re.fullmatch(r"\s*(\d+)\s*", first_sup.get_text())
+    if not num_match:
+        return None
+    before = ""
+    for el in first_sup.previous_elements:
+        if getattr(el, "name", None) in {None, "p", "div", "span"}:
+            if getattr(el, "name", None):
+                continue
+            before = str(el) + before
+        else:
+            break
+    if before.strip():
+        return None
+    return num_match
+
+
+def parse_leading_footnote_marker(html: str) -> tuple[str | None, int | None]:
+    """
+    Classify a leading footnote marker.
+
+    Returns (kind, number). kind is 'sup', 'dotted', 'bare', 'star', or None.
+    Stars have no number. 'dotted' covers '1.' / '1)' / '[^1]'.
+    'bare' is a digit followed by whitespace then text ('1 ברור').
+    """
+    if not html or not str(html).strip():
+        return None, None
+
+    html_match = _FOOTNOTE_MARKER_HTML.match(html)
+    if html_match:
+        return "sup", int(html_match.group(1))
+
+    soup = BeautifulSoup(html, "html.parser")
+    sup_match = _sup_is_leading_marker(soup)
+    if sup_match:
+        return "sup", int(sup_match.group(1))
+
+    plain = soup.get_text(" ", strip=False).lstrip()
+    star = _FOOTNOTE_STAR_PLAIN.match(plain)
+    if star:
+        return "star", None
+    dotted = _FOOTNOTE_DOTTED_PLAIN.match(plain)
+    if dotted:
+        return "dotted", int(dotted.group(1))
+    cite = _FOOTNOTE_CITE_PLAIN.match(plain)
+    if cite:
+        return "dotted", int(cite.group(1))
+    bare = _FOOTNOTE_BARE_PLAIN.match(plain)
+    if bare:
+        return "bare", int(bare.group(1))
+    return None, None
+
+
+def is_new_footnote(
+    html: str,
+    previous_number: int | None,
+    have_footnotes: bool,
+) -> bool:
+    """True if this block starts a new note rather than a page-split continuation."""
+    if not have_footnotes:
+        return True
+    kind, number = parse_leading_footnote_marker(html)
+    if kind is None:
+        return False
+    if kind in {"sup", "dotted", "star"}:
+        return True
+    if kind == "bare" and number is not None:
+        # Bare '1998 Something' is usually a year starting a continuation.
+        if number in _YEARISH_NOTE_NUMBER:
+            if previous_number is None:
+                return True
+            return number == previous_number + 1 or number == 1
+        return True
+    return False
 
 
 def strip_leading_footnote_marker(text: str) -> str:
-    text = _LEADING_MARKER_STRIP.sub("", text, count=1)
+    text = _LEADING_MARKER_STRIP_MD.sub("", text, count=1)
     text = re.sub(r"^\s*\d+\s*[.)]\s*", "", text, count=1)
     return text.strip()
 
 
 def strip_leading_marker_from_html(html: str) -> str:
-    """Remove a leading <sup>n</sup> (or plain n./n)) from footnote HTML."""
+    """Remove a leading <sup>n</sup>, n./n), bare n, or * / ** from footnote HTML."""
+    kind, _number = parse_leading_footnote_marker(html)
     soup = BeautifulSoup(html or "", "html.parser")
-    first_sup = soup.find("sup")
-    if first_sup is not None and re.fullmatch(r"\s*\d+\s*", first_sup.get_text()):
-        before = ""
-        for el in first_sup.previous_elements:
-            if isinstance(el, str):
-                before = el + before
-            elif getattr(el, "name", None) in {"p", "div", "span"}:
-                continue
-            else:
-                before = "x"
-                break
-        if before.strip() == "":
+    if kind == "sup":
+        first_sup = soup.find("sup")
+        if first_sup is not None and _sup_is_leading_marker(soup):
             first_sup.decompose()
             return str(soup)
-    return _LEADING_MARKER_STRIP.sub("", html or "", count=1)
+    for el in soup.find_all(string=True):
+        if str(el).strip():
+            stripped = _LEADING_MARKER_STRIP_HTML.sub("", str(el), count=1)
+            el.replace_with(stripped)
+            break
+    return str(soup)
 
 
 def join_footnote_parts(previous: str, continuation: str) -> str:
@@ -631,6 +705,155 @@ def footnote_html_to_text(html: str) -> str:
     """Convert footnote HTML to a single-line markdown string."""
     md = html_to_markdown(html).strip()
     return re.sub(r"\n+", " ", md).strip()
+
+
+def _fragment_note_number(html: str) -> int | None:
+    _kind, number = parse_leading_footnote_marker(html)
+    return number
+
+
+def _should_split_note_fragment(html: str, last_number: int | None) -> bool:
+    """True if this <br>-separated chunk starts another note, not a line wrap."""
+    kind, number = parse_leading_footnote_marker(html)
+    if kind is None:
+        return False
+    if kind == "star":
+        return True
+    if number is None:
+        return False
+    if last_number is None:
+        return kind in {"sup", "dotted"}
+    if number == last_number + 1 or number == 1:
+        return True
+    # Skipped a note in a <sup>/<n.> sequence (227 then 229).
+    if kind in {"sup", "dotted"} and number > last_number:
+        return True
+    return False
+
+
+def split_footnote_html(html: str) -> list[str]:
+    """
+    Split a Footnote block that already contains several notes.
+
+    DataLab sometimes emits one <p> with <sup>227</sup>…<br/><sup>228</sup>…,
+    or several <p> tags each starting a note. Line-break wraps inside a single
+    note are left joined.
+    """
+    if not html or not str(html).strip():
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    paragraphs = soup.find_all("p")
+    marked_ps = [p for p in paragraphs if parse_leading_footnote_marker(str(p))[0]]
+    if len(paragraphs) >= 2 and len(marked_ps) >= 2:
+        return [str(p) for p in paragraphs]
+
+    pieces = _BR_TAG.split(html)
+    if len(pieces) < 2:
+        return [html]
+
+    last_number = _fragment_note_number(pieces[0])
+    grouped = [pieces[0]]
+    for piece in pieces[1:]:
+        if _should_split_note_fragment(piece, last_number):
+            grouped.append(piece)
+            number = _fragment_note_number(piece)
+            if number is not None:
+                last_number = number
+        else:
+            grouped[-1] = grouped[-1] + "<br/>" + piece
+
+    if len(grouped) < 2:
+        return [html]
+    return grouped
+
+
+def is_notes_section_header(block: dict) -> bool:
+    """True for a chapter 'Notes' / 'Endnotes' / 'הערות' heading."""
+    if block.get("block_type") != "SectionHeader":
+        return False
+    text = re.sub(r"\s+", " ", html_to_plain_text(block.get("html") or "")).strip()
+    text = text.rstrip(".:")
+    if not text:
+        return False
+    if text in _HEBREW_NOTES_HEADINGS:
+        return True
+    return bool(_NOTES_HEADING.match(text))
+
+
+class FootnoteAccumulator:
+    """Collect footnote definitions, merging page-split continuations."""
+
+    def __init__(self) -> None:
+        self.footnotes: list[str] = []
+        self.last_number: int | None = None
+        self.merged_continuations = 0
+        self.split_extra = 0
+        self.endnote_count = 0
+        self.notes_section_count = 0
+        # Asterisk notes are a separate marker system from <sup>n</sup>.
+        # Keep them off the numbered list so body refs pair with endnotes.
+        self._star_notes: list[str] = []
+        self._pending_star_continuation = False
+        self.star_count = 0
+        self.star_ref_next = 1
+        self.star_markers_replaced = 0
+
+    def add_html(self, html: str) -> None:
+        parts = split_footnote_html(html)
+        if len(parts) > 1:
+            self.split_extra += len(parts) - 1
+        for part in parts:
+            self._add_one(part)
+
+    def add_list_html(self, html: str) -> None:
+        soup = BeautifulSoup(html or "", "html.parser")
+        items = soup.find_all("li")
+        if items:
+            for li in items:
+                inner = "".join(str(child) for child in li.contents).strip()
+                self.add_html(inner or str(li))
+        else:
+            self.add_html(html)
+
+    def finalize(self) -> tuple[list[str], list[str]]:
+        """Return numbered definitions and asterisk notes as separate lists."""
+        self.star_count = len(self._star_notes)
+        return self.footnotes, list(self._star_notes)
+
+    def _have_any_notes(self) -> bool:
+        return bool(self.footnotes) or bool(self._star_notes)
+
+    def _add_one(self, html: str) -> None:
+        html = (html or "").strip()
+        if not html:
+            return
+        kind, number = parse_leading_footnote_marker(html)
+        if not is_new_footnote(html, self.last_number, self._have_any_notes()):
+            cont = footnote_html_to_text(html)
+            if self._pending_star_continuation and self._star_notes:
+                self._star_notes[-1] = join_footnote_parts(self._star_notes[-1], cont)
+                self.merged_continuations += 1
+                return
+            if not self.footnotes:
+                self.footnotes.append(cont)
+            else:
+                self.footnotes[-1] = join_footnote_parts(self.footnotes[-1], cont)
+                self.merged_continuations += 1
+            return
+        stripped_html = strip_leading_marker_from_html(html)
+        text = footnote_html_to_text(stripped_html)
+        text = strip_leading_footnote_marker(text)
+        if not text:
+            return
+        if kind == "star":
+            self._star_notes.append(text)
+            self._pending_star_continuation = True
+            return
+        self._pending_star_continuation = False
+        if number is not None:
+            self.last_number = number
+        self.footnotes.append(text)
 
 
 # Block types that can be halves of a paragraph split across a page.
@@ -726,6 +949,63 @@ def is_indented_quote(
     if bbox is None:
         return False
     return (bbox[0] - margin) >= threshold
+
+
+def page_indent_context(page: dict) -> tuple[float | None, float]:
+    """Return (dominant left margin, indent threshold) for a page."""
+    children = page.get("children") or []
+    margin = dominant_left_margin(children)
+    page_bbox = block_bbox(page)
+    page_width = (page_bbox[2] - page_bbox[0]) if page_bbox else None
+    threshold = (
+        max(QUOTE_INDENT_MIN_POINTS, QUOTE_INDENT_MIN_FRACTION * page_width)
+        if page_width
+        else QUOTE_INDENT_MIN_POINTS
+    )
+    return margin, threshold
+
+
+def is_last_quote_candidate(children: list, index: int) -> bool:
+    """True if no later sibling is a body-text quote candidate."""
+    for sibling in children[index + 1 :]:
+        if (
+            isinstance(sibling, dict)
+            and sibling.get("block_type") in _QUOTE_CANDIDATE_TYPES
+        ):
+            return False
+    return True
+
+
+def first_quote_candidate(page: dict | None) -> dict | None:
+    """First body-text block on a page, skipping headers/images/footnotes."""
+    if not page:
+        return None
+    for child in page.get("children") or []:
+        if not isinstance(child, dict):
+            continue
+        if child.get("block_type") in _QUOTE_CANDIDATE_TYPES:
+            return child
+    return None
+
+
+def is_first_line_page_wrap(html: str, next_page: dict | None) -> bool:
+    """
+    True if an indented last-of-page block is the first line of a normal
+    paragraph that continues on the next page.
+
+    In books, only the first line of a body paragraph is indented; later lines
+    sit at the body margin. A real indented paragraph keeps that indent on
+    every line, so a continuation on the next page would still be indented.
+    """
+    nxt = first_quote_candidate(next_page)
+    if nxt is None:
+        return False
+    next_type = nxt.get("block_type") or "Text"
+    next_margin, next_threshold = page_indent_context(next_page)
+    if is_indented_quote(nxt, next_type, next_margin, next_threshold):
+        return False
+    next_html = json_to_html(as_block(nxt))
+    return should_merge_text_blocks(html, next_html)
 
 
 def wrap_blockquote(html: str) -> str:
@@ -1092,31 +1372,38 @@ def build_figure_from_group(group: dict) -> str:
     return build_figure_html(image_html, caption_html)
 
 
-def extract_body_html_and_footnotes(document_json) -> tuple[str, list[str]]:
+def extract_body_html_and_footnotes(
+    document_json,
+) -> tuple[str, list[str], list[str]]:
     """
-    Build body HTML from non-footnote blocks, and collect Footnote blocks.
+    Build body HTML from non-footnote blocks, and collect footnote definitions.
 
     Footnote blocks that do not start with a marker are treated as continuations
-    of the previous footnote (page-break splits). Text blocks split across pages
+    of the previous footnote (page-break splits). After a 'Notes' heading,
+    following paragraphs and list items are collected as endnotes and omitted
+    from the body. In-text * / ** markers on a page are linked to asterisk
+    notes collected on that page; those notes are numbered in the same
+    sequence as superscripts, in body order. Text blocks split across pages
     (possibly with images between them) are merged back into one paragraph.
     """
     pages_body_blocks: list[list[tuple[str, str]]] = []
-    footnotes: list[str] = []
-    merged_continuations = 0
+    acc = FootnoteAccumulator()
     quote_count = 0
+    wrap_skips = 0
+    in_notes_section = False
+    pages = iter_pages(document_json)
 
-    for page in iter_pages(document_json):
+    for page_index, page in enumerate(pages):
         page_blocks: list[tuple[str, str]] = []
         children = page.get("children") or []
+        stars_at_start = len(acc._star_notes)
+        next_page = pages[page_index + 1] if page_index + 1 < len(pages) else None
 
         # Body margin + indent threshold for this page (used to spot quotes).
-        page_margin = dominant_left_margin(children) if DETECT_INDENTED_QUOTES else None
-        page_bbox = block_bbox(page)
-        page_width = (page_bbox[2] - page_bbox[0]) if page_bbox else None
-        indent_threshold = (
-            max(QUOTE_INDENT_MIN_POINTS, QUOTE_INDENT_MIN_FRACTION * page_width)
-            if page_width
-            else QUOTE_INDENT_MIN_POINTS
+        page_margin, indent_threshold = (
+            page_indent_context(page)
+            if DETECT_INDENTED_QUOTES
+            else (None, QUOTE_INDENT_MIN_POINTS)
         )
 
         i = 0
@@ -1128,19 +1415,29 @@ def extract_body_html_and_footnotes(document_json) -> tuple[str, list[str]]:
                 continue
             block_type = child.get("block_type") or "Text"
 
+            if is_notes_section_header(child):
+                in_notes_section = True
+                acc.notes_section_count += 1
+                i += 1
+                continue
+
+            if in_notes_section and block_type == "SectionHeader":
+                in_notes_section = False
+                # Fall through: this header starts the next chapter/section.
+
             if block_type == "Footnote":
-                html = footnote_html(child)
-                # Detect/strip markers on HTML (before markdownify removes <sup>).
-                is_new = not footnotes or starts_with_footnote_marker(html)
-                if not is_new:
-                    cont = footnote_html_to_text(html)
-                    footnotes[-1] = join_footnote_parts(footnotes[-1], cont)
-                    merged_continuations += 1
+                acc.add_html(footnote_html(child))
+                i += 1
+                continue
+
+            if in_notes_section and block_type in _ENDNOTE_BLOCK_TYPES:
+                html = json_to_html(as_block(child))
+                before = len(acc.footnotes)
+                if block_type == "ListGroup":
+                    acc.add_list_html(html)
                 else:
-                    stripped_html = strip_leading_marker_from_html(html)
-                    text = footnote_html_to_text(stripped_html)
-                    text = strip_leading_footnote_marker(text)
-                    footnotes.append(text)
+                    acc.add_html(html)
+                acc.endnote_count += max(0, len(acc.footnotes) - before)
                 i += 1
                 continue
 
@@ -1167,31 +1464,163 @@ def extract_body_html_and_footnotes(document_json) -> tuple[str, list[str]]:
                 and html.strip()
                 and is_indented_quote(child, block_type, page_margin, indent_threshold)
             ):
-                html = wrap_blockquote(html)
-                block_type = _BLOCKQUOTE_TYPE
-                quote_count += 1
+                if (
+                    is_last_quote_candidate(children, i)
+                    and is_first_line_page_wrap(html, next_page)
+                ):
+                    wrap_skips += 1
+                else:
+                    html = wrap_blockquote(html)
+                    block_type = _BLOCKQUOTE_TYPE
+                    quote_count += 1
             page_blocks.append((block_type, html))
             i += 1
+
+        n_new_stars = len(acc._star_notes) - stars_at_start
+        if n_new_stars:
+            page_blocks, n_replaced = replace_page_star_markers(
+                page_blocks, n_new_stars, acc.star_ref_next
+            )
+            acc.star_ref_next += n_replaced
+            acc.star_markers_replaced += n_replaced
+            if n_replaced < n_new_stars:
+                print(
+                    f"⚠ Linked {n_replaced}/{n_new_stars} in-text * marker(s) "
+                    f"on a page with asterisk notes"
+                )
         pages_body_blocks.append(page_blocks)
 
-    if merged_continuations:
-        print(f"🔗 Recombined {merged_continuations} page-split footnote continuation(s)")
+    if acc.merged_continuations:
+        print(f"🔗 Recombined {acc.merged_continuations} page-split footnote continuation(s)")
+    if acc.split_extra:
+        print(f"✂ Split {acc.split_extra} extra note(s) out of multi-note blocks")
+    if acc.endnote_count:
+        print(
+            f"📑 Collected {acc.endnote_count} endnote(s) from "
+            f"{acc.notes_section_count} Notes section(s)"
+        )
     if quote_count:
         print(f"❝ Detected {quote_count} indented paragraph(s) → blockquote")
+    if wrap_skips:
+        print(
+            f"↩ Skipped {wrap_skips} page-ending first line(s) "
+            "(paragraph wrap, not indented block)"
+        )
 
     body_blocks = merge_cross_page_paragraphs(pages_body_blocks)
     body_html = "\n".join(html for _, html in body_blocks if html)
-    return body_html, footnotes
+    numbered, stars = acc.finalize()
+    if stars:
+        print(
+            f"✱ Linked {acc.star_markers_replaced} in-text */** marker(s) "
+            f"→ {len(stars)} asterisk note(s)"
+        )
+    return body_html, numbered, stars
+
+
+def replace_star_markers_in_html(
+    html: str, limit: int, start_k: int
+) -> tuple[str, int]:
+    """Replace up to `limit` footnote-like * / ** in HTML with %%STARREF k%%."""
+    if limit <= 0 or not html or "*" not in html:
+        return html, 0
+    soup = BeautifulSoup(html, "html.parser")
+    replaced = 0
+    k = start_k
+
+    def repl(_match: re.Match) -> str:
+        nonlocal replaced, k
+        if replaced >= limit:
+            return _match.group(0)
+        placeholder = f"%%STARREF{k}%%"
+        replaced += 1
+        k += 1
+        return placeholder
+
+    for el in soup.find_all(string=True):
+        text = str(el)
+        if "*" not in text:
+            continue
+        new = _BODY_STAR_MARKER.sub(repl, text)
+        if new != text:
+            el.replace_with(new)
+        if replaced >= limit:
+            break
+    return str(soup), replaced
+
+
+def replace_page_star_markers(
+    page_blocks: list[tuple[str, str]],
+    n_markers: int,
+    start_k: int,
+) -> tuple[list[tuple[str, str]], int]:
+    """Replace the first n_markers footnote-like * / ** in this page's body blocks."""
+    if n_markers <= 0:
+        return page_blocks, 0
+    remaining = n_markers
+    k = start_k
+    out: list[tuple[str, str]] = []
+    replaced_total = 0
+    for block_type, html in page_blocks:
+        if remaining > 0:
+            html, n = replace_star_markers_in_html(html, remaining, k)
+            k += n
+            remaining -= n
+            replaced_total += n
+        out.append((block_type, html))
+    return out, replaced_total
+
+
+def interleave_footnote_streams(
+    html: str,
+    numbered: list[str],
+    stars: list[str],
+) -> tuple[str, list[str]]:
+    """
+    Number every in-text marker in document order.
+
+    %%NREF k%% takes numbered[k-1]; %%STARREF k%% takes stars[k-1]. The merged
+    sequence is the order the markers appear in the body, so a * between
+    superscripts 20 and 21 becomes [^21] and later notes shift by one.
+    Unreferenced definitions are appended at the end.
+    """
+    combined: list[str] = []
+    used_numbered: set[int] = set()
+    used_stars: set[int] = set()
+
+    def repl(match: re.Match) -> str:
+        kind, idx_s = match.group(1), match.group(2)
+        idx = int(idx_s)
+        if kind == "NREF":
+            if not (1 <= idx <= len(numbered)):
+                return match.group(0)
+            used_numbered.add(idx)
+            combined.append(numbered[idx - 1])
+        else:
+            if not (1 <= idx <= len(stars)):
+                return match.group(0)
+            used_stars.add(idx)
+            combined.append(stars[idx - 1])
+        return f"%%FNREF{len(combined)}%%"
+
+    html = _MARK_PLACEHOLDER.sub(repl, html)
+    for i, text in enumerate(numbered, 1):
+        if i not in used_numbered:
+            combined.append(text)
+    for i, text in enumerate(stars, 1):
+        if i not in used_stars:
+            combined.append(text)
+    return html, combined
 
 
 def replace_body_markers_with_placeholders(html: str) -> tuple[str, int]:
-    """Replace <sup>n</sup> markers in document order with %%FNREF k%% (k = 1..N)."""
+    """Replace <sup>n</sup> markers in document order with %%NREF k%% (k = 1..N)."""
     counter = 0
 
     def repl(_match: re.Match) -> str:
         nonlocal counter
         counter += 1
-        return f"%%FNREF{counter}%%"
+        return f"%%NREF{counter}%%"
 
     return _BODY_SUP_MARKER.sub(repl, html), counter
 
@@ -1903,7 +2332,7 @@ def convert_json_to_markdown(
     """Write markdown next to the source. Returns True if image links were rewritten."""
     report_progress(progress, 90, "Converting JSON → Markdown…")
     print("📝 Converting JSON → Markdown...")
-    html, footnotes = extract_body_html_and_footnotes(document_json)
+    html, numbered, stars = extract_body_html_and_footnotes(document_json)
 
     have_images_source = newly_saved_images or images_dir.is_dir() or bool(images)
 
@@ -1932,6 +2361,8 @@ def convert_json_to_markdown(
         use_images = False
 
     html, marker_count = replace_body_markers_with_placeholders(html)
+    star_marker_count = len(_STAR_PLACEHOLDER.findall(html))
+    html, footnotes = interleave_footnote_streams(html, numbered, stars)
     markdown = html_to_markdown(html)
     markdown = finalize_footnote_refs(markdown)
     markdown = append_footnotes_section(markdown, footnotes)
@@ -1940,33 +2371,56 @@ def convert_json_to_markdown(
         print("🖼️  Wrote cover-image into YAML frontmatter")
     md_path.write_text(markdown, encoding="utf-8")
 
-    if footnotes or marker_count:
+    total_markers = marker_count + star_marker_count
+    if footnotes or total_markers:
         print(
             f"📎 Footnotes: {len(footnotes)} definition(s), "
-            f"{marker_count} in-text marker(s)"
+            f"{marker_count} numbered marker(s), "
+            f"{star_marker_count} */** marker(s)"
         )
-        if footnotes and marker_count and len(footnotes) != marker_count:
+        if footnotes and total_markers and len(footnotes) != total_markers:
             print(
                 "⚠ Marker count and footnote count differ; "
-                "they were paired by document order (1…N)."
+                "they were paired by document order (numbered and */** interleaved)."
             )
 
     return use_images
 
 
-def book_output_dir(source_path: Path) -> Path:
+def book_dir_for(source_path: Path) -> Path:
     """
-    Book folder next to the source file, named after the file stem.
+    Folder that should hold this book's files, named after the file stem.
+
+    If the source already lives in that folder, return its parent.
+    Otherwise the book folder is a sibling named after the stem.
 
     Example: /books/MyBook.pdf → /books/MyBook/
+             /books/MyBook/MyBook.pdf → /books/MyBook/
     """
+    if source_path.parent.name == source_path.stem:
+        return source_path.parent
     return source_path.parent / source_path.stem
 
 
-def ensure_book_dir(source_path: Path) -> Path:
-    out_dir = book_output_dir(source_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
+def prepare_book_dir(source_path: Path) -> tuple[Path, Path]:
+    """
+    Ensure the source file lives in a folder named after its stem.
+
+    If it already does, return that folder unchanged. Otherwise create the
+    folder next to the file and move the source into it.
+
+    Returns (book_dir, source_path_in_book_dir).
+    """
+    book_dir = book_dir_for(source_path)
+    if source_path.parent.resolve() == book_dir.resolve():
+        return book_dir, source_path
+
+    book_dir.mkdir(parents=True, exist_ok=True)
+    dest = book_dir / source_path.name
+    if dest.resolve() != source_path.resolve():
+        shutil.move(str(source_path), str(dest))
+        print(f"📦 Moved {source_path.name} → {book_dir.name}/")
+    return book_dir, dest
 
 
 def resolve_images_dir(book_dir: Path) -> Path:
@@ -2017,7 +2471,7 @@ def process_pdf(
         raise RuntimeError("Response did not include JSON output.")
 
     stem = pdf_path.stem
-    out_dir = ensure_book_dir(pdf_path)
+    out_dir, pdf_path = prepare_book_dir(pdf_path)
     json_path = out_dir / f"{stem}.json"
     md_path = out_dir / f"{stem}.md"
     images_dir = out_dir / IMAGES_DIR_NAME
@@ -2119,20 +2573,7 @@ def process_json(
     document_json = load_document_json(json_path)
 
     stem = json_path.stem
-    # If the JSON already lives in a book folder named after the stem, use it;
-    # otherwise create that folder next to the JSON (and write outputs there).
-    if json_path.parent.name == stem:
-        out_dir = json_path.parent
-        working_json = json_path
-    else:
-        out_dir = ensure_book_dir(json_path)
-        working_json = out_dir / f"{stem}.json"
-        if working_json.resolve() != json_path.resolve():
-            working_json.write_text(
-                json.dumps(document_json, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            print(f"💾 Copied JSON → {working_json}")
+    out_dir, json_path = prepare_book_dir(json_path)
 
     md_path = out_dir / f"{stem}.md"
     images_dir = resolve_images_dir(out_dir)
@@ -2171,7 +2612,7 @@ def process_json(
     report_progress(progress, 100, "Done")
     print("\n✅ Done!")
     print(f"   Folder:   {out_dir}")
-    print(f"   JSON:     {working_json}")
+    print(f"   JSON:     {json_path}")
     print(f"   Markdown: {md_path}")
     if used_images:
         print(f"   Images:   {images_dir}/")
@@ -2215,7 +2656,7 @@ class ConversionApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("PDF → Markdown (Datalab)")
+        self.title("PDF → Markdown")
         self.minsize(520, 220)
         self.resizable(True, False)
 
@@ -2226,7 +2667,7 @@ class ConversionApp(tk.Tk):
         self._base64_var = tk.BooleanVar(value=EMBED_IMAGES_AS_BASE64)
         self._extract_cover_var = tk.BooleanVar(value=EXTRACT_COVER)
         self._cover_page_var = tk.StringVar(value=str(COVER_PAGE_DEFAULT))
-        self._status_var = tk.StringVar(value="Select a PDF or JSON file to begin.")
+        self._status_var = tk.StringVar()
         self._progress_var = tk.DoubleVar(value=0.0)
 
         self._build()
@@ -2319,6 +2760,7 @@ class ConversionApp(tk.Tk):
         self._progress.grid(
             row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 4)
         )
+        self._progress.grid_remove()
 
         ttk.Label(root, textvariable=self._status_var, wraplength=480).grid(
             row=7, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8)
@@ -2357,6 +2799,8 @@ class ConversionApp(tk.Tk):
             return
         if path is not None:
             self._file_var.set(str(path))
+            if not self._running:
+                self._reset_progress_ui()
 
     def _sync_page_range_state(self) -> None:
         path = self._file_var.get().strip()
@@ -2391,7 +2835,14 @@ class ConversionApp(tk.Tk):
         self._base64_check.configure(state="normal")
         self._sync_cover_state()
 
+    def _reset_progress_ui(self) -> None:
+        """Clear leftover conversion progress when a new file is chosen."""
+        self._progress_var.set(0)
+        self._progress.grid_remove()
+        self._status_var.set("")
+
     def _set_progress(self, percent: float, message: str) -> None:
+        self._progress.grid()
         self._progress_var.set(percent)
         self._status_var.set(message)
 
@@ -2480,19 +2931,33 @@ class ConversionApp(tk.Tk):
                 progress=self._ui_progress,
             )
         except Exception as exc:
-            self.after(0, lambda e=exc: self._on_error(e))
+            self.after(0, lambda e=exc, p=path: self._on_error(e, p))
             return
-        self.after(0, lambda d=out_dir: self._on_success(d))
+        self.after(0, lambda d=out_dir, p=path: self._on_success(d, p))
 
-    def _on_success(self, out_dir: Path) -> None:
+    def _point_file_at_book_dir(self, original: Path, out_dir: Path | None = None) -> None:
+        """Keep the file field in sync if the source was moved into a book folder."""
+        candidates: list[Path] = []
+        if out_dir is not None:
+            candidates.append(out_dir / original.name)
+        candidates.append(original.parent / original.stem / original.name)
+        for cand in candidates:
+            if cand.is_file():
+                self._file_var.set(str(cand))
+                return
+
+    def _on_success(self, out_dir: Path, original: Path) -> None:
         self._running = False
         self._convert_btn.configure(state="normal")
+        self._point_file_at_book_dir(original, out_dir)
         self._set_progress(100, f"Done — saved to {out_dir}")
         messagebox.showinfo("Conversion complete", f"Output folder:\n{out_dir}")
 
-    def _on_error(self, exc: BaseException) -> None:
+    def _on_error(self, exc: BaseException, original: Path) -> None:
         self._running = False
         self._convert_btn.configure(state="normal")
+        if not original.exists():
+            self._point_file_at_book_dir(original)
         self._status_var.set(f"Error: {exc}")
         messagebox.showerror("Conversion failed", str(exc))
 
