@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import base64
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -21,27 +23,103 @@ def extract_headings(text: str) -> list[tuple[int, str]]:
     return headings
 
 
-# Whitelist of allowed EPUB metadata fields
+# Whitelist of allowed EPUB metadata fields, including aliases used in
+# pdf_to_markdown YAML (language/pubdate).
 EPUB_METADATA_FIELDS = {
-    'title', 'author', 'date', 'description', 'cover-image', 'isbn', 
-    'publisher', 'rights', 'lang'
+    'title', 'author', 'date', 'description', 'cover-image', 'isbn',
+    'publisher', 'rights', 'lang', 'language', 'pubdate',
 }
+
+METADATA_FIELD_ALIASES = {
+    'language': 'lang',
+    'pubdate': 'date',
+}
+
+DATA_URI_RE = re.compile(
+    r'^data:(image/[A-Za-z0-9.+-]+)(?:;charset=[^;]+)?;base64,(.+)$',
+    re.DOTALL,
+)
+
+MIME_TO_SUFFIX = {
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/png': '.png',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+}
+
+YAML_FRONTMATTER_RE = re.compile(r'^---\r?\n(.*?)\r?\n---\r?\n', re.DOTALL)
 
 
 def extract_yaml_metadata(text: str) -> dict:
     """Extract YAML frontmatter from markdown and filter to allowed fields."""
-    yaml_match = re.match(r'^---\n(.*?)\n---\n', text, re.DOTALL)
+    yaml_match = YAML_FRONTMATTER_RE.match(text)
     if not yaml_match:
         return {}
-    
+
     try:
         metadata = yaml.safe_load(yaml_match.group(1)) or {}
-        # Filter to only allowed fields
-        filtered = {k: v for k, v in metadata.items() if k in EPUB_METADATA_FIELDS}
-        return filtered
+        return {k: v for k, v in metadata.items() if k in EPUB_METADATA_FIELDS}
     except yaml.YAMLError:
         print("⚠ Warning: Could not parse YAML frontmatter, ignoring metadata")
         return {}
+
+
+def strip_yaml_frontmatter(text: str) -> str:
+    """Remove YAML frontmatter so pandoc does not treat cover-image as a path."""
+    yaml_match = YAML_FRONTMATTER_RE.match(text)
+    if not yaml_match:
+        return text
+    return text[yaml_match.end():]
+
+
+def normalize_metadata(metadata: dict) -> dict:
+    """Map field aliases and drop empty values."""
+    normalized = {}
+    for key, value in metadata.items():
+        key = METADATA_FIELD_ALIASES.get(key, key)
+        if key in normalized and value in (None, ""):
+            continue
+        normalized[key] = value
+    return {k: v for k, v in normalized.items() if v not in (None, "")}
+
+
+def materialize_cover_image(
+    cover_value: object,
+    md_path: Path,
+    dest_dir: Path,
+) -> Path | None:
+    """Turn a cover-image YAML value into a file path pandoc can use.
+
+    pdf_to_markdown stores either a data URI or a relative path. Pandoc's
+    --epub-cover-image needs a real file, and a data URI is far too large to
+    pass as a command-line -M argument.
+    """
+    if not isinstance(cover_value, str):
+        return None
+    cover_value = cover_value.strip()
+    if not cover_value:
+        return None
+
+    match = DATA_URI_RE.match(cover_value)
+    if match:
+        mime, b64 = match.group(1).lower(), match.group(2)
+        suffix = MIME_TO_SUFFIX.get(mime, '.jpg')
+        out_path = dest_dir / f"cover{suffix}"
+        try:
+            out_path.write_bytes(base64.b64decode(b64))
+        except (ValueError, OSError) as exc:
+            print(f"⚠ Warning: Could not decode cover-image data URI: {exc}")
+            return None
+        return out_path
+
+    path = Path(cover_value)
+    if not path.is_absolute():
+        path = (md_path.parent / path).resolve()
+    if path.exists():
+        return path
+    print(f"⚠ Warning: Cover image not found: {cover_value}")
+    return None
 
 
 def anchor_from_heading(title: str) -> str:
@@ -61,19 +139,19 @@ def generate_toc(headings: list[tuple[int, str]]) -> str:
     """Generate markdown TOC with links from headings."""
     if not headings:
         return ""
-    
+
     min_level = min(level for level, _ in headings)
     toc_lines = []
-    
+
     for level, title in headings:
         # Skip first heading (assumed to be document title)
         if len(toc_lines) == 0 and level == min_level:
             continue
-        
+
         indent = "  " * (level - min_level - 1)
         anchor = anchor_from_heading(title)
         toc_lines.append(f"{indent}- [{title}](#{anchor})")
-    
+
     return "\n".join(toc_lines)
 
 
@@ -82,16 +160,16 @@ def insert_toc_after_contents(text: str, toc: str) -> str:
     lines = text.split('\n')
     contents_idx = None
     contents_level = None
-    
+
     for i, line in enumerate(lines):
         if re.match(r'^(#{1,6})\s+contents\s*$', line, re.IGNORECASE):
             contents_idx = i
             contents_level = len(re.match(r'^(#{1,6})', line).group(1))
             break
-    
+
     if contents_idx is None:
         return text
-    
+
     # Find next heading at same/higher level
     next_heading = None
     for i in range(contents_idx + 1, len(lines)):
@@ -99,12 +177,12 @@ def insert_toc_after_contents(text: str, toc: str) -> str:
         if m and len(m.group(1)) <= contents_level:
             next_heading = i
             break
-    
+
     # Insert TOC after contents heading
     result = lines[:contents_idx + 1] + [""] + toc.split('\n') + [""]
     if next_heading is not None:
         result += lines[next_heading:]
-    
+
     return '\n'.join(result)
 
 
@@ -130,11 +208,15 @@ def select_file_zenity() -> Path:
     return Path(result.stdout.strip())
 
 
-def run_pandoc(input_path: Path, output_path: Path, metadata: dict = None) -> None:
+def run_pandoc(
+    input_path: Path,
+    output_path: Path,
+    *,
+    resource_path: Path,
+    metadata_file: Path | None = None,
+    cover_image: Path | None = None,
+) -> None:
     """Run pandoc to convert markdown to EPUB."""
-    if metadata is None:
-        metadata = {}
-    
     cmd = [
         "pandoc",
         str(input_path),
@@ -145,11 +227,14 @@ def run_pandoc(input_path: Path, output_path: Path, metadata: dict = None) -> No
         "--epub-chapter-level=1",
         "--toc-depth=6",
         "--reference-location=document",
+        "--resource-path",
+        str(resource_path),
     ]
-    
-    # Add metadata as -M arguments
-    for key, value in metadata.items():
-        cmd.extend(["-M", f"{key}={value}"])
+
+    if metadata_file is not None:
+        cmd.extend(["--metadata-file", str(metadata_file)])
+    if cover_image is not None:
+        cmd.extend(["--epub-cover-image", str(cover_image)])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -197,16 +282,34 @@ def main() -> None:
     headings = extract_headings(content)
     toc = generate_toc(headings)
     processed = insert_toc_after_contents(content, toc)
-    metadata = extract_yaml_metadata(content)
-    
-    # Write to temp file for pandoc
-    temp_file = input_path.with_stem(input_path.stem + "_temp")
-    temp_file.write_text(processed, encoding="utf-8")
-    
-    try:
-        run_pandoc(temp_file, output_path, metadata)
-    finally:
-        temp_file.unlink()
+    metadata = normalize_metadata(extract_yaml_metadata(content))
+    cover_value = metadata.pop("cover-image", None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        temp_file = tmpdir / f"{input_path.stem}.md"
+        temp_file.write_text(strip_yaml_frontmatter(processed), encoding="utf-8")
+
+        metadata_file = None
+        if metadata:
+            metadata_file = tmpdir / "metadata.yaml"
+            with metadata_file.open("w", encoding="utf-8") as fh:
+                yaml.safe_dump(
+                    metadata,
+                    fh,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+
+        cover_image = materialize_cover_image(cover_value, input_path, tmpdir)
+        run_pandoc(
+            temp_file,
+            output_path,
+            resource_path=input_path.parent,
+            metadata_file=metadata_file,
+            cover_image=cover_image,
+        )
 
     print(f"\n✅ EPUB created: {output_path}")
 
