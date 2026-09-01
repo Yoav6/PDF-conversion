@@ -23,6 +23,7 @@ import time
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 from tkinter import messagebox, simpledialog, ttk
 from types import SimpleNamespace
 
@@ -61,6 +62,9 @@ DETECT_INDENTED_QUOTES = True
 # 0.0194 catches ~25pt indents on typical 1288pt-wide pages (just under 0.02).
 QUOTE_INDENT_MIN_FRACTION = 0.0194
 QUOTE_INDENT_MIN_POINTS = 12.0
+# Datalab marks centered titles/verse with style="text-align: center;" (or align=)
+# in block HTML. Preserve that as a raw HTML wrapper; markdownify would drop it.
+PRESERVE_CENTERED_TEXT = True
 API_KEY_FILE = Path(__file__).resolve().parent / "datalab_api_key.txt"
 API_KEY_PLACEHOLDER = "YOUR_API_KEY_HERE"
 API_KEY_FILE_TEMPLATE = (
@@ -552,8 +556,9 @@ _LEADING_MARKER_STRIP_MD = re.compile(
 )
 _BODY_SUP_MARKER = re.compile(r"<sup>\s*(\d+)\s*</sup>", re.IGNORECASE)
 _FN_PLACEHOLDER = re.compile(r"%%FNREF(\d+)%%")
-_STAR_PLACEHOLDER = re.compile(r"%%STARREF(\d+)%%")
-_MARK_PLACEHOLDER = re.compile(r"%%(NREF|STARREF)(\d+)%%")
+_STAR_PLACEHOLDER = re.compile(r"%%STARREF(\d+)(?:P(\d+))?%%")
+_MARK_PLACEHOLDER = re.compile(r"%%(NREF|STARREF)(\d+)(?:P(\d+))?%%")
+_DATALAB_PAGE_ID = re.compile(r"/page/(\d+)")
 # In-text * / ** footnote markers sit after a word or punctuation (Harrison,* / justified.*).
 # Leading * at the start of a paragraph is the note itself, not a body ref.
 _BODY_STAR_MARKER = re.compile(
@@ -567,6 +572,78 @@ _NOTES_HEADING = re.compile(
 _HEBREW_NOTES_HEADINGS = frozenset({"הערות", "הערות שוליים", "הערות סוף"})
 _ENDNOTE_BLOCK_TYPES = frozenset({"Text", "TextInlineMath", "ListGroup"})
 _YEARISH_NOTE_NUMBER = range(1000, 2100)
+_FOOTNOTE_GAP_LOG_LIMIT = 20
+# After a chapter whose last marker is at least this, a body 1 is a new chapter
+# (do not reuse that chapter's [^1]). A 1 after only a handful of notes may be
+# a repeated marker (1, 2, then 1, 2, 3…).
+_CHAPTER_RESTART_AFTER = 8
+# Page-bottom notes whose labels stay this small and restart at 1 on more than
+# one page are paired only with markers on the same PDF page (Life of HG).
+_PAGE_RESTART_MAX_ORIG = 12
+
+
+class NumberedFootnote(NamedTuple):
+    """Original OCR label, definition text, 0-based Datalab page, and source."""
+
+    orig: int | None
+    text: str
+    page: int | None = None
+    # "page" = page-bottom Footnote (or Text that starts with <sup>n</sup>).
+    # "endnote" = collected after a Notes heading; pair globally with body refs.
+    source: str = "page"
+
+
+class StarFootnote(NamedTuple):
+    text: str
+    page: int | None = None
+
+
+def is_leading_sup_footnote_html(html: str) -> bool:
+    """True if this block starts with <sup>n</sup> (a definition, not a body ref)."""
+    kind, _number = parse_leading_footnote_marker(html)
+    return kind == "sup"
+
+
+def datalab_page_index(node: dict | None) -> int | None:
+    """0-based PDF page index from a Datalab block (`page` or `/page/N/…` id)."""
+    if not isinstance(node, dict):
+        return None
+    page = node.get("page")
+    if isinstance(page, int):
+        return page
+    ident = str(node.get("id") or "")
+    match = _DATALAB_PAGE_ID.search(ident)
+    return int(match.group(1)) if match else None
+
+
+def pdf_page_1based(page: int | None) -> str:
+    if page is None:
+        return "?"
+    return str(page + 1)
+
+
+def format_unreferenced_footnote(text: str, page: int | None) -> str:
+    return (
+        f"(Unreferenced footnote; Defined on page {pdf_page_1based(page)}) {text}"
+    )
+
+
+def format_undefined_footnote(marker: str, page: int | None) -> str:
+    return (
+        f"(Undefined footnote; Referenced as {marker} on page {pdf_page_1based(page)})"
+    )
+
+
+def nref_placeholder(orig: int, page: int | None) -> str:
+    if page is None:
+        return f"%%NREF{orig}%%"
+    return f"%%NREF{orig}P{page}%%"
+
+
+def starref_placeholder(k: int, page: int | None) -> str:
+    if page is None:
+        return f"%%STARREF{k}%%"
+    return f"%%STARREF{k}P{page}%%"
 
 
 def html_to_plain_text(html: str) -> str:
@@ -630,6 +707,21 @@ def parse_leading_footnote_marker(html: str) -> tuple[str | None, int | None]:
     return None, None
 
 
+def _number_looks_like_year(number: int | None) -> bool:
+    return number is not None and number in _YEARISH_NOTE_NUMBER
+
+
+def _is_plausible_new_note_number(number: int | None, previous: int | None) -> bool:
+    """False for 4-digit years that are not the next note, or a restart at 1."""
+    if number is None:
+        return False
+    if not _number_looks_like_year(number):
+        return True
+    if previous is None:
+        return True
+    return number == previous + 1 or number == 1
+
+
 def is_new_footnote(
     html: str,
     previous_number: int | None,
@@ -641,15 +733,12 @@ def is_new_footnote(
     kind, number = parse_leading_footnote_marker(html)
     if kind is None:
         return False
-    if kind in {"sup", "dotted", "star"}:
+    if kind in {"sup", "star"}:
         return True
-    if kind == "bare" and number is not None:
-        # Bare '1998 Something' is usually a year starting a continuation.
-        if number in _YEARISH_NOTE_NUMBER:
-            if previous_number is None:
-                return True
-            return number == previous_number + 1 or number == 1
-        return True
+    # Dotted '1983)' / '1983.' is usually a year in a continuation, same as bare
+    # '1998 Something', unless it continues the note sequence or restarts at 1.
+    if kind in {"dotted", "bare"}:
+        return _is_plausible_new_note_number(number, previous_number)
     return False
 
 
@@ -722,9 +811,14 @@ def _should_split_note_fragment(html: str, last_number: int | None) -> bool:
     if number is None:
         return False
     if last_number is None:
+        if _number_looks_like_year(number) and kind != "sup":
+            return False
         return kind in {"sup", "dotted"}
     if number == last_number + 1 or number == 1:
         return True
+    # '1983)' after note 25 is a citation year, not footnote 1983.
+    if _number_looks_like_year(number) and kind != "sup":
+        return False
     # Skipped a note in a <sup>/<n.> sequence (227 then 229).
     if kind in {"sup", "dotted"} and number > last_number:
         return True
@@ -785,7 +879,7 @@ class FootnoteAccumulator:
     """Collect footnote definitions, merging page-split continuations."""
 
     def __init__(self) -> None:
-        self.footnotes: list[str] = []
+        self.footnotes: list[NumberedFootnote] = []
         self.last_number: int | None = None
         self.merged_continuations = 0
         self.split_extra = 0
@@ -793,38 +887,39 @@ class FootnoteAccumulator:
         self.notes_section_count = 0
         # Asterisk notes are a separate marker system from <sup>n</sup>.
         # Keep them off the numbered list so body refs pair with endnotes.
-        self._star_notes: list[str] = []
+        self._star_notes: list[StarFootnote] = []
         self._pending_star_continuation = False
         self.star_count = 0
         self.star_ref_next = 1
         self.star_markers_replaced = 0
+        self.text_sup_footnote_count = 0
 
-    def add_html(self, html: str) -> None:
+    def add_html(self, html: str, page: int | None = None, source: str = "page") -> None:
         parts = split_footnote_html(html)
         if len(parts) > 1:
             self.split_extra += len(parts) - 1
         for part in parts:
-            self._add_one(part)
+            self._add_one(part, page, source)
 
-    def add_list_html(self, html: str) -> None:
+    def add_list_html(self, html: str, page: int | None = None, source: str = "page") -> None:
         soup = BeautifulSoup(html or "", "html.parser")
         items = soup.find_all("li")
         if items:
             for li in items:
                 inner = "".join(str(child) for child in li.contents).strip()
-                self.add_html(inner or str(li))
+                self.add_html(inner or str(li), page, source)
         else:
-            self.add_html(html)
+            self.add_html(html, page, source)
 
-    def finalize(self) -> tuple[list[str], list[str]]:
-        """Return numbered definitions and asterisk notes as separate lists."""
+    def finalize(self) -> tuple[list[NumberedFootnote], list[StarFootnote]]:
+        """Return numbered definitions (label, text, page) and asterisk notes."""
         self.star_count = len(self._star_notes)
         return self.footnotes, list(self._star_notes)
 
     def _have_any_notes(self) -> bool:
         return bool(self.footnotes) or bool(self._star_notes)
 
-    def _add_one(self, html: str) -> None:
+    def _add_one(self, html: str, page: int | None = None, source: str = "page") -> None:
         html = (html or "").strip()
         if not html:
             return
@@ -832,13 +927,22 @@ class FootnoteAccumulator:
         if not is_new_footnote(html, self.last_number, self._have_any_notes()):
             cont = footnote_html_to_text(html)
             if self._pending_star_continuation and self._star_notes:
-                self._star_notes[-1] = join_footnote_parts(self._star_notes[-1], cont)
+                prev = self._star_notes[-1]
+                self._star_notes[-1] = StarFootnote(
+                    join_footnote_parts(prev.text, cont), prev.page
+                )
                 self.merged_continuations += 1
                 return
             if not self.footnotes:
-                self.footnotes.append(cont)
+                self.footnotes.append(NumberedFootnote(None, cont, page, source))
             else:
-                self.footnotes[-1] = join_footnote_parts(self.footnotes[-1], cont)
+                prev = self.footnotes[-1]
+                self.footnotes[-1] = NumberedFootnote(
+                    prev.orig,
+                    join_footnote_parts(prev.text, cont),
+                    prev.page,
+                    prev.source,
+                )
                 self.merged_continuations += 1
             return
         stripped_html = strip_leading_marker_from_html(html)
@@ -847,13 +951,13 @@ class FootnoteAccumulator:
         if not text:
             return
         if kind == "star":
-            self._star_notes.append(text)
+            self._star_notes.append(StarFootnote(text, page))
             self._pending_star_continuation = True
             return
         self._pending_star_continuation = False
         if number is not None:
             self.last_number = number
-        self.footnotes.append(text)
+        self.footnotes.append(NumberedFootnote(number, text, page, source))
 
 
 # Block types that can be halves of a paragraph split across a page.
@@ -878,6 +982,8 @@ _CAPTION_TYPE = "Caption"
 
 # Block types whose left edge is compared against the page margin to spot quotes.
 _QUOTE_CANDIDATE_TYPES = frozenset({"Text", "TextInlineMath"})
+# Block types whose HTML may carry Datalab's text-align:center (not tables/figures).
+_CENTERED_CANDIDATE_TYPES = frozenset({"Text", "TextInlineMath", "SectionHeader"})
 # Sentinel block type for indented paragraphs (kept out of the merge types above
 # so cross-page paragraph merging leaves standalone quotes untouched).
 _BLOCKQUOTE_TYPE = "BlockQuote"
@@ -1010,6 +1116,54 @@ def is_first_line_page_wrap(html: str, next_page: dict | None) -> bool:
 
 def wrap_blockquote(html: str) -> str:
     return f"<blockquote>{html}</blockquote>"
+
+
+_CENTER_STYLE_RE = re.compile(r"text-align\s*:\s*center", re.IGNORECASE)
+_CENTER_SENTINEL_START = "<!--md-center-->"
+_CENTER_SENTINEL_END = "<!--/md-center-->"
+
+
+def element_is_centered(tag) -> bool:
+    """True if a tag is explicitly center-aligned (style or align=)."""
+    if not getattr(tag, "name", None):
+        return False
+    align = str(tag.get("align") or "").strip().lower()
+    if align == "center":
+        return True
+    style = str(tag.get("style") or "")
+    return bool(_CENTER_STYLE_RE.search(style))
+
+
+def html_is_centered(html: str) -> bool:
+    """
+    True if this block's HTML is marked centered by Datalab.
+
+    Table cell alignment is ignored — that is column layout, not a centered block.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup.find_all(True):
+        if tag.find_parent(["table", "td", "th"]) is not None:
+            continue
+        if element_is_centered(tag):
+            return True
+    return False
+
+
+def wrap_centered_html(html: str) -> str:
+    """Mark a block so html_to_markdown can emit a center-aligned HTML wrapper."""
+    return f"{_CENTER_SENTINEL_START}{html}{_CENTER_SENTINEL_END}"
+
+
+def emit_centered_html(inner_html: str) -> str:
+    """
+    Wrap original HTML in a center-aligned element.
+
+    Inner markup stays HTML (<br>, <i>, headings) so Obsidian / Readest / pandoc
+    render it without needing to parse markdown inside the wrapper. Footnote
+    placeholders become <sup>n</sup> because [^n] would show as literal text.
+    """
+    inner = _FN_PLACEHOLDER.sub(r"<sup>\1</sup>", (inner_html or "").strip())
+    return f'<div align="center" style="text-align: center;">{inner}</div>'
 
 
 def unwrap_outer_paragraph(html: str) -> str:
@@ -1374,7 +1528,7 @@ def build_figure_from_group(group: dict) -> str:
 
 def extract_body_html_and_footnotes(
     document_json,
-) -> tuple[str, list[str], list[str]]:
+) -> tuple[str, list[NumberedFootnote], list[StarFootnote]]:
     """
     Build body HTML from non-footnote blocks, and collect footnote definitions.
 
@@ -1382,13 +1536,14 @@ def extract_body_html_and_footnotes(
     of the previous footnote (page-break splits). After a 'Notes' heading,
     following paragraphs and list items are collected as endnotes and omitted
     from the body. In-text * / ** markers on a page are linked to asterisk
-    notes collected on that page; those notes are numbered in the same
-    sequence as superscripts, in body order. Text blocks split across pages
+    notes collected on that page; numbered body refs are later paired with
+    definitions by original superscript. Text blocks split across pages
     (possibly with images between them) are merged back into one paragraph.
     """
     pages_body_blocks: list[list[tuple[str, str]]] = []
     acc = FootnoteAccumulator()
     quote_count = 0
+    center_count = 0
     wrap_skips = 0
     in_notes_section = False
     pages = iter_pages(document_json)
@@ -1426,20 +1581,40 @@ def extract_body_html_and_footnotes(
                 # Fall through: this header starts the next chapter/section.
 
             if block_type == "Footnote":
-                acc.add_html(footnote_html(child))
+                acc.add_html(
+                    footnote_html(child),
+                    page=datalab_page_index(child) or datalab_page_index(page),
+                    source="endnote" if in_notes_section else "page",
+                )
                 i += 1
                 continue
 
             if in_notes_section and block_type in _ENDNOTE_BLOCK_TYPES:
                 html = json_to_html(as_block(child))
                 before = len(acc.footnotes)
+                note_page = datalab_page_index(child) or datalab_page_index(page)
                 if block_type == "ListGroup":
-                    acc.add_list_html(html)
+                    acc.add_list_html(html, note_page, source="endnote")
                 else:
-                    acc.add_html(html)
+                    acc.add_html(html, note_page, source="endnote")
                 acc.endnote_count += max(0, len(acc.footnotes) - before)
                 i += 1
                 continue
+
+            if (
+                not in_notes_section
+                and block_type in _ENDNOTE_BLOCK_TYPES
+            ):
+                preview = json_to_html(as_block(child))
+                if is_leading_sup_footnote_html(preview):
+                    acc.add_html(
+                        preview,
+                        page=datalab_page_index(child) or datalab_page_index(page),
+                        source="page",
+                    )
+                    acc.text_sup_footnote_count += 1
+                    i += 1
+                    continue
 
             if block_type in _IMAGE_GROUP_TYPES:
                 page_blocks.append((block_type, build_figure_from_group(child)))
@@ -1459,7 +1634,16 @@ def extract_body_html_and_footnotes(
                 continue
 
             html = json_to_html(as_block(child))
-            if (
+            centered = (
+                PRESERVE_CENTERED_TEXT
+                and block_type in _CENTERED_CANDIDATE_TYPES
+                and html.strip()
+                and html_is_centered(html)
+            )
+            if centered:
+                html = wrap_centered_html(html)
+                center_count += 1
+            elif (
                 DETECT_INDENTED_QUOTES
                 and html.strip()
                 and is_indented_quote(child, block_type, page_margin, indent_threshold)
@@ -1477,9 +1661,10 @@ def extract_body_html_and_footnotes(
             i += 1
 
         n_new_stars = len(acc._star_notes) - stars_at_start
+        page_num = datalab_page_index(page)
         if n_new_stars:
             page_blocks, n_replaced = replace_page_star_markers(
-                page_blocks, n_new_stars, acc.star_ref_next
+                page_blocks, n_new_stars, acc.star_ref_next, page_num
             )
             acc.star_ref_next += n_replaced
             acc.star_markers_replaced += n_replaced
@@ -1488,12 +1673,21 @@ def extract_body_html_and_footnotes(
                     f"⚠ Linked {n_replaced}/{n_new_stars} in-text * marker(s) "
                     f"on a page with asterisk notes"
                 )
+        page_blocks = [
+            (block_type, replace_body_markers_in_html(html, page_num)[0])
+            for block_type, html in page_blocks
+        ]
         pages_body_blocks.append(page_blocks)
 
     if acc.merged_continuations:
         print(f"🔗 Recombined {acc.merged_continuations} page-split footnote continuation(s)")
     if acc.split_extra:
         print(f"✂ Split {acc.split_extra} extra note(s) out of multi-note blocks")
+    if acc.text_sup_footnote_count:
+        print(
+            f"📎 Collected {acc.text_sup_footnote_count} footnote(s) from "
+            "Text blocks that start with <sup>n</sup>"
+        )
     if acc.endnote_count:
         print(
             f"📑 Collected {acc.endnote_count} endnote(s) from "
@@ -1501,6 +1695,8 @@ def extract_body_html_and_footnotes(
         )
     if quote_count:
         print(f"❝ Detected {quote_count} indented paragraph(s) → blockquote")
+    if center_count:
+        print(f"⊙ Centered {center_count} block(s) → HTML")
     if wrap_skips:
         print(
             f"↩ Skipped {wrap_skips} page-ending first line(s) "
@@ -1519,7 +1715,7 @@ def extract_body_html_and_footnotes(
 
 
 def replace_star_markers_in_html(
-    html: str, limit: int, start_k: int
+    html: str, limit: int, start_k: int, page: int | None = None
 ) -> tuple[str, int]:
     """Replace up to `limit` footnote-like * / ** in HTML with %%STARREF k%%."""
     if limit <= 0 or not html or "*" not in html:
@@ -1532,7 +1728,7 @@ def replace_star_markers_in_html(
         nonlocal replaced, k
         if replaced >= limit:
             return _match.group(0)
-        placeholder = f"%%STARREF{k}%%"
+        placeholder = starref_placeholder(k, page)
         replaced += 1
         k += 1
         return placeholder
@@ -1553,6 +1749,7 @@ def replace_page_star_markers(
     page_blocks: list[tuple[str, str]],
     n_markers: int,
     start_k: int,
+    page: int | None = None,
 ) -> tuple[list[tuple[str, str]], int]:
     """Replace the first n_markers footnote-like * / ** in this page's body blocks."""
     if n_markers <= 0:
@@ -1563,7 +1760,7 @@ def replace_page_star_markers(
     replaced_total = 0
     for block_type, html in page_blocks:
         if remaining > 0:
-            html, n = replace_star_markers_in_html(html, remaining, k)
+            html, n = replace_star_markers_in_html(html, remaining, k, page)
             k += n
             remaining -= n
             replaced_total += n
@@ -1571,58 +1768,341 @@ def replace_page_star_markers(
     return out, replaced_total
 
 
+def _footnote_preview(text: str, limit: int = 70) -> str:
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _emit_footnote_gap_logs(unused_logs: list[str], missing_logs: list[str]) -> None:
+    for line in unused_logs[:_FOOTNOTE_GAP_LOG_LIMIT]:
+        print(line)
+    extra_unused = len(unused_logs) - _FOOTNOTE_GAP_LOG_LIMIT
+    if extra_unused > 0:
+        print(f"⚠ … and {extra_unused} more unused definition(s)")
+    for line in missing_logs[:_FOOTNOTE_GAP_LOG_LIMIT]:
+        print(line)
+    extra_missing = len(missing_logs) - _FOOTNOTE_GAP_LOG_LIMIT
+    if extra_missing > 0:
+        print(f"⚠ … and {extra_missing} more in-text marker(s) with no definition")
+    if unused_logs or missing_logs:
+        print(
+            f"⚠ Footnote pairing: {len(unused_logs)} unused definition(s), "
+            f"{len(missing_logs)} in-text marker(s) with no definition "
+            f"(unreferenced keep their text; undefined cite marker and PDF page)"
+        )
+
+
+def _page_bottom_restarts_each_page(numbered: list[NumberedFootnote]) -> bool:
+    """True when page-bottom labels restart at 1 on most notes pages (not 1…N)."""
+    by_page: dict[int | None, list[int]] = {}
+    for note in numbered:
+        if note.source == "endnote" or note.orig is None:
+            continue
+        by_page.setdefault(note.page, []).append(note.orig)
+    if len(by_page) < 2:
+        return False
+    pages_with_1 = sum(1 for origs in by_page.values() if 1 in origs)
+    max_orig = max(max(origs) for origs in by_page.values())
+    # Restart-per-page: labels stay small and most notes pages have a 1.
+    # Continuing 1…N across pages has few 1s (chapter starts) even if max is small
+    # in a short excerpt.
+    return (
+        pages_with_1 >= 2
+        and max_orig <= _PAGE_RESTART_MAX_ORIG
+        and pages_with_1 * 3 >= len(by_page) * 2
+    )
+
+
 def interleave_footnote_streams(
     html: str,
-    numbered: list[str],
-    stars: list[str],
+    numbered: list[NumberedFootnote],
+    stars: list[StarFootnote],
 ) -> tuple[str, list[str]]:
     """
-    Number every in-text marker in document order.
+    Pair in-text markers with definitions by original number, in document order.
 
-    %%NREF k%% takes numbered[k-1]; %%STARREF k%% takes stars[k-1]. The merged
-    sequence is the order the markers appear in the body, so a * between
-    superscripts 20 and 21 becomes [^21] and later notes shift by one.
-    Unreferenced definitions are appended at the end.
+    Page-bottom notes that restart at 1 each page bind only to markers on that
+    PDF page, so a leftover 2 cannot steal later pages' 1s. A marker on a page
+    with no notes may still take the next/previous page (wrapped paragraph).
+    Page-bottom notes whose numbers continue across pages also try the adjacent
+    page and reuse an earlier same-chapter definition (repeated 1, 2, …).
+    Chapter endnotes still walk a global stream. %%STARREF k%% takes stars[k-1].
+    Unused definitions are appended at the end.
     """
-    combined: list[str] = []
-    used_numbered: set[int] = set()
-    used_stars: set[int] = set()
+    numbered = [
+        item if isinstance(item, NumberedFootnote)
+        else NumberedFootnote(
+            item[0],
+            item[1],
+            item[2] if len(item) > 2 else None,
+            item[3] if len(item) > 3 else "page",
+        )
+        for item in numbered
+    ]
+    stars = [
+        item if isinstance(item, StarFootnote)
+        else (
+            StarFootnote(item, None) if isinstance(item, str)
+            else StarFootnote(item[0], item[1] if len(item) > 1 else None)
+        )
+        for item in stars
+    ]
 
-    def repl(match: re.Match) -> str:
-        kind, idx_s = match.group(1), match.group(2)
-        idx = int(idx_s)
-        if kind == "NREF":
-            if not (1 <= idx <= len(numbered)):
-                return match.group(0)
-            used_numbered.add(idx)
-            combined.append(numbered[idx - 1])
+    page_unused: dict[int | None, list[NumberedFootnote]] = {}
+    endnotes: list[NumberedFootnote] = []
+    for note in numbered:
+        if note.source == "endnote":
+            endnotes.append(note)
         else:
-            if not (1 <= idx <= len(stars)):
-                return match.group(0)
-            used_stars.add(idx)
-            combined.append(stars[idx - 1])
+            page_unused.setdefault(note.page, []).append(note)
+    page_bottom_pages = set(page_unused)
+    restart_per_page = _page_bottom_restarts_each_page(numbered)
+
+    combined: list[str] = []
+    def_i = 0
+    used_stars: set[int] = set()
+    unused_logs: list[str] = []
+    missing_logs: list[str] = []
+    skipped_numbered: list[str] = []
+    last_n_orig: int | None = None
+    matched_in_chapter: dict[int, int] = {}
+    matched_on_page: dict[tuple[int | None, int], int] = {}
+
+    def take_def(text: str) -> str:
+        combined.append(text)
         return f"%%FNREF{len(combined)}%%"
 
+    def bind_endnote(m: int, text: str) -> str:
+        nonlocal last_n_orig
+        placeholder = take_def(text)
+        last_n_orig = m
+        matched_in_chapter[m] = len(combined)
+        return placeholder
+
+    def log_unused(orig: int | None, text: str, page: int | None) -> None:
+        label = orig if orig is not None else "?"
+        unused_logs.append(
+            f"⚠ No in-text marker for footnote {label} "
+            f"(PDF p. {pdf_page_1based(page)}): {_footnote_preview(text)}"
+        )
+
+    def skip_unused_endnote() -> None:
+        nonlocal def_i
+        note = endnotes[def_i]
+        log_unused(note.orig, note.text, note.page)
+        skipped_numbered.append(format_unreferenced_footnote(note.text, note.page))
+        def_i += 1
+
+    def missing_for(m: int, ref_page: int | None, marker: str | None = None) -> str:
+        shown = marker if marker is not None else str(m)
+        missing_logs.append(
+            f"⚠ No definition for in-text marker {shown} "
+            f"(PDF p. {pdf_page_1based(ref_page)})"
+        )
+        return bind_endnote(m, format_undefined_footnote(shown, ref_page))
+
+    def take_from_page(page: int | None, m: int) -> NumberedFootnote | None:
+        unused = page_unused.get(page)
+        if not unused:
+            return None
+        for j, note in enumerate(unused):
+            if note.orig == m:
+                return unused.pop(j)
+        return None
+
+    def leftover_before_chapter_one() -> int | None:
+        if last_n_orig is None:
+            return None
+        n = 0
+        j = def_i
+        while j < len(endnotes) and n <= 10:
+            d_orig = endnotes[j].orig
+            if d_orig == 1:
+                return n
+            if d_orig is None or d_orig > last_n_orig:
+                n += 1
+                j += 1
+                continue
+            return None
+        return None
+
+    def earliest_remaining_page() -> int | None:
+        pages = [page for page, unused in page_unused.items() if unused]
+        if not pages:
+            return None
+        numbered_pages = [page for page in pages if page is not None]
+        if numbered_pages:
+            return min(numbered_pages)
+        return None
+
+    def consume_page_note(note: NumberedFootnote, m: int, bind_page: int | None) -> str:
+        placeholder = take_def(note.text)
+        matched_on_page[(bind_page, m)] = len(combined)
+        if not restart_per_page:
+            bind_endnote_state(m)
+        return placeholder
+
+    def bind_endnote_state(m: int) -> None:
+        nonlocal last_n_orig
+        last_n_orig = m
+        matched_in_chapter[m] = len(combined)
+
+    def try_adjacent_page(m: int, ref_page: int | None) -> str | None:
+        if ref_page is None:
+            return None
+        for adj in (ref_page + 1, ref_page - 1):
+            found = take_from_page(adj, m)
+            if found is not None:
+                placeholder = consume_page_note(found, m, adj)
+                matched_on_page[(ref_page, m)] = len(combined)
+                return placeholder
+        return None
+
+    def bind_page_bottom_local(m: int, ref_page: int | None) -> str:
+        found = take_from_page(ref_page, m)
+        if found is not None:
+            placeholder = take_def(found.text)
+            matched_on_page[(ref_page, m)] = len(combined)
+            return placeholder
+        reuse_at = matched_on_page.get((ref_page, m))
+        if reuse_at is not None:
+            return f"%%FNREF{reuse_at}%%"
+        missing_logs.append(
+            f"⚠ No definition for in-text marker {m} "
+            f"(PDF p. {pdf_page_1based(ref_page)})"
+        )
+        placeholder = take_def(format_undefined_footnote(str(m), ref_page))
+        matched_on_page[(ref_page, m)] = len(combined)
+        return placeholder
+
+    def bind_continuing_page_notes(m: int, ref_page: int | None) -> str | None:
+        """Match continuing page-bottom numbers; None if the caller should try endnotes."""
+        if m == 1 and last_n_orig is not None and last_n_orig != 1:
+            if last_n_orig >= _CHAPTER_RESTART_AFTER:
+                matched_in_chapter.clear()
+
+        found = take_from_page(ref_page, m)
+        if found is not None:
+            return consume_page_note(found, m, ref_page)
+
+        # Def often sits on the next page only when this page already has notes.
+        if ref_page in page_bottom_pages:
+            adjacent = try_adjacent_page(m, ref_page)
+            if adjacent is not None:
+                return adjacent
+
+        reuse_at = matched_on_page.get((ref_page, m))
+        if reuse_at is not None:
+            return f"%%FNREF{reuse_at}%%"
+        rem_page = earliest_remaining_page()
+        if m in matched_in_chapter and rem_page is not None and (
+            ref_page is None or rem_page > ref_page
+        ):
+            return f"%%FNREF{matched_in_chapter[m]}%%"
+        if endnotes:
+            return None
+        return missing_for(m, ref_page)
+
+    def bind_endnote_stream(m: int, ref_page: int | None) -> str:
+        nonlocal def_i, last_n_orig
+        if m == 1 and last_n_orig is not None and last_n_orig != 1:
+            d_next = endnotes[def_i].orig if def_i < len(endnotes) else None
+            if d_next == 1:
+                matched_in_chapter.clear()
+            else:
+                tail = leftover_before_chapter_one()
+                if tail is not None:
+                    for _ in range(tail):
+                        skip_unused_endnote()
+                    matched_in_chapter.clear()
+                elif last_n_orig >= _CHAPTER_RESTART_AFTER:
+                    matched_in_chapter.clear()
+        next_orig = endnotes[def_i].orig if def_i < len(endnotes) else None
+        if m in matched_in_chapter and next_orig != m:
+            return f"%%FNREF{matched_in_chapter[m]}%%"
+
+        while def_i < len(endnotes):
+            note = endnotes[def_i]
+            if note.orig == m:
+                def_i += 1
+                return bind_endnote(m, note.text)
+            if note.orig is None:
+                skip_unused_endnote()
+                continue
+            if note.orig == 1 and m != 1:
+                return missing_for(m, ref_page)
+            if _number_looks_like_year(note.orig) and note.orig != m:
+                skip_unused_endnote()
+                continue
+            if note.orig < m:
+                skip_unused_endnote()
+                continue
+            return missing_for(m, ref_page)
+        return missing_for(m, ref_page)
+
+    def repl(match: re.Match) -> str:
+        kind, idx_s, page_s = match.group(1), match.group(2), match.group(3)
+        idx = int(idx_s)
+        ref_page = int(page_s) if page_s else None
+        if kind == "STARREF":
+            if not (1 <= idx <= len(stars)):
+                missing_logs.append(
+                    f"⚠ No definition for in-text * marker "
+                    f"(PDF p. {pdf_page_1based(ref_page)})"
+                )
+                return take_def(format_undefined_footnote("*", ref_page))
+            used_stars.add(idx)
+            return take_def(stars[idx - 1].text)
+
+        m = idx
+        if restart_per_page and ref_page in page_bottom_pages:
+            return bind_page_bottom_local(m, ref_page)
+        if not restart_per_page:
+            bound = bind_continuing_page_notes(m, ref_page)
+            if bound is not None:
+                return bound
+            return bind_endnote_stream(m, ref_page)
+        adjacent = try_adjacent_page(m, ref_page)
+        if adjacent is not None:
+            return adjacent
+        return bind_endnote_stream(m, ref_page)
+
     html = _MARK_PLACEHOLDER.sub(repl, html)
-    for i, text in enumerate(numbered, 1):
-        if i not in used_numbered:
-            combined.append(text)
-    for i, text in enumerate(stars, 1):
+    while def_i < len(endnotes):
+        skip_unused_endnote()
+    for _page, unused in page_unused.items():
+        for note in unused:
+            log_unused(note.orig, note.text, note.page)
+            skipped_numbered.append(format_unreferenced_footnote(note.text, note.page))
+    combined.extend(skipped_numbered)
+    for i, star in enumerate(stars, 1):
         if i not in used_stars:
-            combined.append(text)
+            unused_logs.append(
+                f"⚠ No in-text marker for asterisk note {i} "
+                f"(PDF p. {pdf_page_1based(star.page)}): {_footnote_preview(star.text)}"
+            )
+            combined.append(format_unreferenced_footnote(star.text, star.page))
+    _emit_footnote_gap_logs(unused_logs, missing_logs)
     return html, combined
 
 
-def replace_body_markers_with_placeholders(html: str) -> tuple[str, int]:
-    """Replace <sup>n</sup> markers in document order with %%NREF k%% (k = 1..N)."""
+def replace_body_markers_in_html(
+    html: str, page: int | None = None
+) -> tuple[str, int]:
+    """Replace <sup>n</sup> with %%NREFnPpage%%, keeping the original superscript."""
     counter = 0
 
-    def repl(_match: re.Match) -> str:
+    def repl(match: re.Match) -> str:
         nonlocal counter
         counter += 1
-        return f"%%NREF{counter}%%"
+        orig = int(match.group(1))
+        return nref_placeholder(orig, page)
 
     return _BODY_SUP_MARKER.sub(repl, html), counter
+
+
+def replace_body_markers_with_placeholders(html: str) -> tuple[str, int]:
+    """Replace any remaining <sup>n</sup> after per-page substitution."""
+    return replace_body_markers_in_html(html, page=None)
 
 
 def finalize_footnote_refs(markdown: str) -> str:
@@ -2270,6 +2750,30 @@ def combine_consecutive_headings(text: str) -> str:
 
 _FIGURE_BLOCK_RE = re.compile(r"<figure\b.*?</figure>", re.IGNORECASE | re.DOTALL)
 _FIGURE_PLACEHOLDER_RE = re.compile(r"%%FIGURE(\d+)%%")
+_CENTER_BLOCK_RE = re.compile(
+    re.escape(_CENTER_SENTINEL_START) + r"(.*?)" + re.escape(_CENTER_SENTINEL_END),
+    re.IGNORECASE | re.DOTALL,
+)
+_CENTER_PLACEHOLDER_RE = re.compile(r"%%CENTER(\d+)%%")
+
+
+class _PdfMarkdownConverter(MarkdownConverter):
+    """markdownify with project-specific tweaks."""
+
+    def convert_hr(self, el, text, parent_tags):
+        # Use *** not --- so pandoc yaml_metadata_block won't misparse <hr> output.
+        return "\n\n***\n\n"
+
+
+def _new_markdown_converter() -> MarkdownConverter:
+    return _PdfMarkdownConverter(
+        heading_style="ATX",
+        bullets="*",
+        escape_misc=False,
+        escape_underscores=True,
+        escape_asterisks=True,
+        strong_em_symbol="*",  # *italic*, **bold**, ***both***
+    )
 
 
 def html_to_markdown(html: str) -> str:
@@ -2283,20 +2787,28 @@ def html_to_markdown(html: str) -> str:
 
     html = _FIGURE_BLOCK_RE.sub(_stash_figure, html)
 
+    # Stash Datalab-centered blocks; markdownify would strip text-align.
+    centers: list[str] = []
+
+    def _stash_center(match: re.Match) -> str:
+        centers.append(match.group(1))
+        return f"\n\n%%CENTER{len(centers) - 1}%%\n\n"
+
+    html = _CENTER_BLOCK_RE.sub(_stash_center, html)
+
     html = normalize_list_html(html)
-    converter = MarkdownConverter(
-        heading_style="ATX",
-        bullets="*",
-        escape_misc=False,
-        escape_underscores=True,
-        escape_asterisks=True,
-        strong_em_symbol="*",  # *italic*, **bold**, ***both***
-    )
-    markdown = converter.convert(html)
+    markdown = _new_markdown_converter().convert(html)
     markdown = html_emphasis_tags_to_markdown(markdown)
     markdown = normalize_list_markdown(markdown)
     markdown = combine_consecutive_headings(markdown)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+
+    if centers:
+        markdown = _CENTER_PLACEHOLDER_RE.sub(
+            lambda m: emit_centered_html(centers[int(m.group(1))]),
+            markdown,
+        )
+        markdown = re.sub(r"\n{3,}", "\n\n", markdown)
 
     if figures:
         markdown = _FIGURE_PLACEHOLDER_RE.sub(
@@ -2360,7 +2872,10 @@ def convert_json_to_markdown(
         html = strip_image_tags(html)
         use_images = False
 
-    html, marker_count = replace_body_markers_with_placeholders(html)
+    html, _extra = replace_body_markers_with_placeholders(html)
+    marker_count = sum(
+        1 for match in _MARK_PLACEHOLDER.finditer(html) if match.group(1) == "NREF"
+    )
     star_marker_count = len(_STAR_PLACEHOLDER.findall(html))
     html, footnotes = interleave_footnote_streams(html, numbered, stars)
     markdown = html_to_markdown(html)
@@ -2376,13 +2891,9 @@ def convert_json_to_markdown(
         print(
             f"📎 Footnotes: {len(footnotes)} definition(s), "
             f"{marker_count} numbered marker(s), "
-            f"{star_marker_count} */** marker(s)"
+            f"{star_marker_count} */** marker(s); "
+            "numbered notes paired by original superscript"
         )
-        if footnotes and total_markers and len(footnotes) != total_markers:
-            print(
-                "⚠ Marker count and footnote count differ; "
-                "they were paired by document order (numbered and */** interleaved)."
-            )
 
     return use_images
 

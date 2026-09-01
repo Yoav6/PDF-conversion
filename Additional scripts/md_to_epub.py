@@ -73,6 +73,14 @@ def strip_yaml_frontmatter(text: str) -> str:
     return text[yaml_match.end():]
 
 
+_HORIZONTAL_RULE_RE = re.compile(r"(?m)^---\s*$")
+
+
+def normalize_horizontal_rules(text: str) -> str:
+    """Replace --- horizontal rules with *** for pandoc yaml_metadata_block."""
+    return _HORIZONTAL_RULE_RE.sub("***", text)
+
+
 def normalize_metadata(metadata: dict) -> dict:
     """Map field aliases and drop empty values."""
     normalized = {}
@@ -288,7 +296,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         temp_file = tmpdir / f"{input_path.stem}.md"
-        temp_file.write_text(strip_yaml_frontmatter(processed), encoding="utf-8")
+        temp_file.write_text(
+            normalize_horizontal_rules(strip_yaml_frontmatter(processed)),
+            encoding="utf-8",
+        )
 
         metadata_file = None
         if metadata:

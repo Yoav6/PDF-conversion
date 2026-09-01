@@ -10,9 +10,9 @@ The markdown is formatted to work with [Obsidian](https://obsidian.md) and [Read
 
 ### Footnotes
 
-- Inline footnote markers (`<sup>1</sup>`) in the body are converted to Pandoc-style references (`[^1]`), renumbered consecutively in the order they appear.
-- Footnote blocks are pulled out of the page flow and collected into a single `# Footnotes` section at the end of the document as `[^n]:` definitions.
-- A block is a new note if it starts with `<sup>n</sup>`, `n.` / `n)`, a bare number plus text (`1 ברור`), or `*` / `**`. Blocks with no marker are treated as page-break continuations and stitched back (including hyphenated and mid-sentence breaks). A leading 4-digit year is not treated as a note number unless it continues the sequence.
+- Inline footnote markers (`<sup>1</sup>`) in the body are converted to Pandoc-style references (`[^1]`), renumbered consecutively in the order they appear. Numbered markers are paired with definitions by the original superscript, not by queue position, so a missing `<sup>` does not shift later notes. A second marker for the same number is a new note when another definition with that number is still waiting (page-bottom notes that restart at 1); otherwise it reuses the earlier definition. A `Text` block that starts with `<sup>n</sup>` is treated as a definition, not as a body reference.
+- Footnote blocks are pulled out of the page flow and collected into a single `# Footnotes` section at the end of the document as `[^n]:` definitions. Page-bottom notes that restart at 1 each page pair with markers **on that PDF page**, so a leftover note cannot shift later pages; a marker on a page with no notes may still take the next or previous page. Notes whose numbers continue across pages also match the adjacent page and reuse an earlier same-chapter definition. Chapter endnotes after a Notes heading (including Footnote blocks in that section) pair globally by original number. A body marker with no matching definition is recorded as `(Undefined footnote; Referenced as Y on page X)` (Y is the original in-text number or `*`, X is the 1-based PDF page). Unused definitions are kept at the end as `(Unreferenced footnote; Defined on page X)` followed by their text. Gaps are also logged during conversion.
+- A block is a new note if it starts with `<sup>n</sup>`, `n.` / `n)`, a bare number plus text (`1 ברור`), or `*` / `**`. Blocks with no marker are treated as page-break continuations and stitched back (including hyphenated and mid-sentence breaks). A leading 4-digit year (`1998 …` or `1983)`) is not treated as a note number unless it continues the sequence or restarts at 1.
 - A single Footnote block that already contains several notes (for example `<sup>227</sup>…<br/><sup>228</sup>…`) is split into separate definitions.
 - After a "Notes" / "Endnotes" heading, following paragraphs and list items are collected as definitions and omitted from the body, so chapter endnotes pair with in-text markers. Superscripts inside those sections are not counted as body refs. In-text `*` / `**` markers (e.g. `Harrison,*`) and their asterisk notes are numbered in the same sequence as superscripts, in the order they appear in the body.
 
@@ -24,6 +24,10 @@ Paragraphs (and list groups) that are broken across a page boundary are merged b
 ### Indented quotes → blockquotes
 
 Block quotes in the original are usually typeset with a wider left margin. The script estimates each page's dominant body-text margin from block bounding boxes, and any text block indented past it by more than a threshold is rendered as a markdown blockquote (`> …`).
+
+### Centered text
+
+Datalab marks centered titles, epigraphs, and verse with `style="text-align: center;"` (or `align="center"`) on the block's HTML. Those blocks are emitted as raw HTML (`<div align="center" style="text-align: center;">…</div>`), with inner tags (`<br>`, `<i>`, headings) left as HTML so they render in Obsidian, Readest, and pandoc. Table-cell alignment is left alone.
 
 ### Images and captions
 
