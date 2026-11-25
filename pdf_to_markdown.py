@@ -973,6 +973,9 @@ _SKIPPABLE_BETWEEN_PARAS = frozenset({
     "PageHeader",
     "PageFooter",
 })
+# Running heads / page numbers. Datalab used to return these with empty HTML, but since
+# its 2026-10-20 update the JSON output carries their text, so drop them explicitly.
+_DROPPED_BLOCK_TYPES = frozenset({"PageHeader", "PageFooter"})
 _LIST_INDENT_CLASS = re.compile(r"list-indent-(\d+)", re.IGNORECASE)
 
 # Image block types (leaf images, and the groups that pair an image with a caption).
@@ -1210,31 +1213,37 @@ def has_continuation_marker(html: str) -> bool:
 
 
 def html_starts_like_continuation(html: str) -> bool:
-    """True if the block begins with a letter (optionally after inline tags)."""
-    inner = unwrap_outer_paragraph(html)
-    return bool(re.match(r"^(?:\s|<[^>]+>)*[A-Za-z]", inner or ""))
+    """
+    True if the block begins with content that could continue mid-flow text.
 
-
-def html_starts_with_lowercase(html: str) -> bool:
-    """Strong signal that text continues a previous sentence across a page break."""
-    plain = html_to_plain_text(html)
-    return bool(re.match(r"[a-z]", plain or ""))
+    Accepts letters, digits, brackets, quotes, and common punctuation/symbols —
+    not only lowercase letters (names and mid-sentence capitals are valid).
+    """
+    plain = html_to_plain_text(html).lstrip()
+    if not plain:
+        return False
+    return bool(
+        re.match(
+            r"[A-Za-z0-9(\[{""''""*—–\-@#$%&+=/\\|<>.,:;!?]",
+            plain,
+            re.UNICODE,
+        )
+    )
 
 
 def should_merge_text_blocks(first_html: str, second_html: str) -> bool:
     """
     Decide whether two text blocks across a page boundary should be joined.
 
-    - Marker has-continuation or hyphenated end → merge if next starts with a letter
-    - Soft mid-sentence end → merge only if next starts with a lowercase letter
-      (avoids gluing a period-less paragraph to a new capitalized paragraph)
+    - Marker has-continuation or hyphenated end → merge if next looks continuable
+    - Soft mid-sentence end → merge if next looks continuable (same rule)
     """
     if not html_starts_like_continuation(second_html):
         return False
     if has_continuation_marker(first_html) or html_ends_with_hyphen(first_html):
         return True
     if html_ends_soft(first_html):
-        return html_starts_with_lowercase(second_html)
+        return True
     return False
 
 
@@ -1253,7 +1262,7 @@ def merge_paragraph_html(first_html: str, second_html: str) -> str:
         a,
         re.IGNORECASE,
     )
-    if hyphen_match and re.match(r"^(?:\s|<[^>]+>)*[A-Za-z]", b):
+    if hyphen_match and html_starts_like_continuation(f"<p>{b}</p>"):
         trailing_sup = hyphen_match.group(1) or ""
         a = a[: hyphen_match.start()] + trailing_sup
         return f"<p>{a}{b}</p>"
@@ -1321,26 +1330,17 @@ def merge_list_group_html(first_html: str, second_html: str) -> str:
 
     if first_lis and getattr(first_item, "name", None) == "li":
         last_li = first_lis[-1]
-        next_text = first_item.get_text(" ", strip=False).lstrip()
-        if html_ends_incomplete(str(last_li)) and re.match(r"[A-Za-z]", next_text or ""):
-            # Merge item text using the same hyphen/soft-break rules.
-            # Prefer lowercase start for soft (non-hyphen) joins.
-            if (
-                has_continuation_marker(str(last_li))
-                or html_ends_with_hyphen(str(last_li))
-                or html_starts_with_lowercase(str(first_item))
-            ):
-                merged_inner = merge_paragraph_html(
-                    f"<p>{last_li.decode_contents()}</p>",
-                    f"<p>{first_item.decode_contents()}</p>",
-                )
-                last_li.clear()
-                for node in BeautifulSoup(
-                    unwrap_outer_paragraph(merged_inner), "html.parser"
-                ).contents:
-                    last_li.append(node if not isinstance(node, str) else node)
-            else:
-                first_ul.append(first_item.extract() if first_item.parent else first_item)
+        last_html = f"<p>{last_li.decode_contents()}</p>"
+        next_html = f"<p>{first_item.decode_contents()}</p>"
+        if html_ends_incomplete(str(last_li)) and should_merge_text_blocks(
+            last_html, next_html
+        ):
+            merged_inner = merge_paragraph_html(last_html, next_html)
+            last_li.clear()
+            for node in BeautifulSoup(
+                unwrap_outer_paragraph(merged_inner), "html.parser"
+            ).contents:
+                last_li.append(node if not isinstance(node, str) else node)
         else:
             first_ul.append(first_item.extract() if first_item.parent else first_item)
     else:
@@ -1569,6 +1569,10 @@ def extract_body_html_and_footnotes(
                 i += 1
                 continue
             block_type = child.get("block_type") or "Text"
+
+            if block_type in _DROPPED_BLOCK_TYPES:
+                i += 1
+                continue
 
             if is_notes_section_header(child):
                 in_notes_section = True
@@ -2934,6 +2938,68 @@ def prepare_book_dir(source_path: Path) -> tuple[Path, Path]:
     return book_dir, dest
 
 
+def find_source_pdf(book_dir: Path, stem: str) -> Path | None:
+    """Locate the book's PDF next to its JSON: same stem first, else the only PDF there."""
+    same_stem = book_dir / f"{stem}.pdf"
+    if same_stem.is_file():
+        return same_stem
+    pdfs = [p for p in book_dir.iterdir() if p.suffix.lower() == ".pdf" and p.is_file()]
+    return pdfs[0] if len(pdfs) == 1 else None
+
+
+def build_cover_yaml(
+    pdf_path: Path | None,
+    cover_page: int,
+    *,
+    images_dir: Path,
+    md_path: Path,
+    download_images: bool,
+    embed_images_as_base64: bool,
+    progress: ProgressFn | None = None,
+) -> str | None:
+    """
+    Return the YAML cover-image value, or None if no cover can be produced.
+
+    Renders ``cover_page`` from ``pdf_path`` when given (saving it to images/ if
+    download_images is on). Without a PDF, reuses an existing images/cover.jpg.
+    """
+    if not (download_images or embed_images_as_base64):
+        return None
+
+    cover_bytes: bytes | None = None
+    if pdf_path is not None:
+        report_progress(progress, 85, f"Extracting cover (page {cover_page})…")
+        try:
+            cover_bytes = render_cover_jpeg(pdf_path, cover_page)
+        except Exception as exc:
+            print(f"⚠ Cover extraction failed: {exc}")
+        else:
+            if download_images:
+                images_dir.mkdir(parents=True, exist_ok=True)
+                cover_path = images_dir / cover_image_filename()
+                cover_path.write_bytes(cover_bytes)
+                print(
+                    f"🖼️  Saved cover (page {cover_page}) → "
+                    f"{IMAGES_DIR_NAME}/{cover_path.name}"
+                )
+
+    if cover_bytes is None:
+        existing = images_dir / cover_image_filename()
+        if not existing.is_file():
+            if pdf_path is None:
+                print("⚠ No PDF or existing cover image found; cover-image left empty.")
+            return None
+        cover_bytes = existing.read_bytes()
+        print(f"🖼️  Using existing cover: {IMAGES_DIR_NAME}/{existing.name}")
+
+    return cover_image_yaml_value(
+        cover_bytes,
+        embed_base64=embed_images_as_base64,
+        images_dir=images_dir,
+        md_path=md_path,
+    )
+
+
 def resolve_images_dir(book_dir: Path) -> Path:
     """Prefer book_dir/images; fall back to legacy book_dir_images next to it."""
     modern = book_dir / IMAGES_DIR_NAME
@@ -3009,28 +3075,19 @@ def process_pdf(
     elif not images:
         print("ℹ️  No images in response.")
 
-    cover_yaml: str | None = None
-    do_cover = extract_cover and (download_images or embed_images_as_base64)
-    if do_cover:
-        report_progress(progress, 85, f"Extracting cover (page {cover_page})…")
-        try:
-            cover_bytes = render_cover_jpeg(pdf_path, cover_page)
-            if download_images:
-                images_dir.mkdir(parents=True, exist_ok=True)
-                cover_path = images_dir / cover_image_filename()
-                cover_path.write_bytes(cover_bytes)
-                print(
-                    f"🖼️  Saved cover (page {cover_page}) → "
-                    f"{IMAGES_DIR_NAME}/{cover_path.name}"
-                )
-            cover_yaml = cover_image_yaml_value(
-                cover_bytes,
-                embed_base64=embed_images_as_base64,
-                images_dir=images_dir,
-                md_path=md_path,
-            )
-        except Exception as exc:
-            print(f"⚠ Cover extraction failed: {exc}")
+    cover_yaml = (
+        build_cover_yaml(
+            pdf_path,
+            cover_page,
+            images_dir=images_dir,
+            md_path=md_path,
+            download_images=download_images,
+            embed_images_as_base64=embed_images_as_base64,
+            progress=progress,
+        )
+        if extract_cover
+        else None
+    )
 
     used_images = convert_json_to_markdown(
         document_json,
@@ -3069,10 +3126,15 @@ def process_json(
     *,
     embed_images_as_base64: bool | None = None,
     download_images: bool = True,
+    extract_cover: bool = EXTRACT_COVER,
+    cover_page: int = COVER_PAGE_DEFAULT,
     progress: ProgressFn | None = None,
 ) -> Path:
     """
     Convert an existing Datalab JSON file to markdown.
+
+    The cover comes from an existing images/cover.jpg if present, otherwise it
+    is rendered from the book's PDF in the same folder.
 
     Returns the output folder path. Raises on failure.
     """
@@ -3108,6 +3170,23 @@ def process_json(
     else:
         print("ℹ️  No images folder found in the book directory.")
 
+    # Prefer an existing images/cover.jpg (keeps the cover from the original
+    # conversion); only render from the PDF when there is none.
+    has_existing_cover = (images_dir / cover_image_filename()).is_file()
+    cover_yaml = (
+        build_cover_yaml(
+            None if has_existing_cover else find_source_pdf(out_dir, stem),
+            cover_page,
+            images_dir=images_dir,
+            md_path=md_path,
+            download_images=download_images,
+            embed_images_as_base64=embed_images_as_base64,
+            progress=progress,
+        )
+        if extract_cover
+        else None
+    )
+
     report_progress(progress, 70, "Converting JSON → Markdown…")
     used_images = convert_json_to_markdown(
         document_json,
@@ -3117,6 +3196,7 @@ def process_json(
         embed_images_as_base64=embed_images_as_base64,
         download_images=download_images,
         images=images,
+        cover_image=cover_yaml,
         progress=progress,
     )
 
@@ -3157,6 +3237,8 @@ def run_conversion(
             input_path,
             embed_images_as_base64=embed_images_as_base64,
             download_images=download_images,
+            extract_cover=extract_cover,
+            cover_page=cover_page,
             progress=progress,
         )
     raise ValueError("Please select a PDF (*.pdf) or JSON (*.json) file.")
@@ -3324,11 +3406,13 @@ class ConversionApp(tk.Tk):
 
     def _cover_available(self) -> bool:
         path = self._file_var.get().strip()
-        is_pdf = path.lower().endswith(".pdf") or path == ""
+        # JSON input renders the cover from the book's PDF in the same folder
+        # (or reuses images/cover.jpg), so the option applies to both.
+        is_supported = path.lower().endswith((".pdf", ".json")) or path == ""
         has_image_output = bool(
             self._download_images_var.get() or self._base64_var.get()
         )
-        return is_pdf and has_image_output
+        return is_supported and has_image_output
 
     def _sync_cover_state(self) -> None:
         # Cover needs a PDF plus either a saved file or a base64 embed target.
